@@ -29,18 +29,29 @@ Quick start:
 """
 
 from .quant_types   import QuantFormat, quant, TORCH_DTYPE, FORMAT_BITS, all_formats, sweep_pairs
-from .quant_linear  import QuantLinear
-from .model_patcher import patch_model, unpatch_model, count_layers, list_linear_layers, QuantAttnContext
+from .quant_linear  import QuantLinear, QuantLinearMatVec
+from .model_patcher import (
+    patch_model,
+    patch_model_matvec,
+    unpatch_model,
+    count_layers,
+    list_linear_layers,
+    QuantAttnContext,
+)
 from .stats_tracker import StatsTracker, Component, StatsReport
+from .ulp_noise import UlpNoiseConfig, UlpNoiseMode, ulp_step, inject_ulp_noise
 from .eval_harness  import (
     QuantConfig,
+    MatVecQuantConfig,
     EvalResult,
     run_quantization_eval,
+    run_quantization_eval_matvec,
     run_sweep,
     default_sweep_configs,
     results_to_dataframe,
     save_results,
 )
+from .noise_sweep import NoiseSweepSpec, run_noise_sweep_grid, run_noise_sweep_for_config, matvec_format_grid, DEFAULT_FORMATS_4
 
 __all__ = [
     # Types
@@ -52,22 +63,37 @@ __all__ = [
     "sweep_pairs",
     # Core modules
     "QuantLinear",
+    "QuantLinearMatVec",
     # Patching
     "patch_model",
+    "patch_model_matvec",
     "unpatch_model",
     "count_layers",
     "list_linear_layers",
     "QuantAttnContext",
+    # ULP utilities
+    "UlpNoiseConfig",
+    "UlpNoiseMode",
+    "ulp_step",
+    "inject_ulp_noise",
     # Stats
     "StatsTracker",
     "Component",
     "StatsReport",
     # Evaluation
     "QuantConfig",
+    "MatVecQuantConfig",
     "EvalResult",
     "run_quantization_eval",
+    "run_quantization_eval_matvec",
     "run_sweep",
     "default_sweep_configs",
     "results_to_dataframe",
     "save_results",
+    # Sweep helpers
+    "NoiseSweepSpec",
+    "DEFAULT_FORMATS_4",
+    "matvec_format_grid",
+    "run_noise_sweep_for_config",
+    "run_noise_sweep_grid",
 ]
