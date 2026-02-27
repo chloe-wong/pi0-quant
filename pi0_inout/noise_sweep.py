@@ -18,7 +18,7 @@ import torch.nn as nn
 from .eval_harness import MatVecQuantConfig, run_quantization_eval_matvec
 from .quant_types import QuantFormat
 from .stats_tracker import Component
-from .ulp_noise import UlpNoiseConfig, UlpNoiseMode
+from .ulp_noise import UlpNoiseConfig
 
 
 DEFAULT_FORMATS_4 = [
@@ -34,11 +34,6 @@ class NoiseSweepSpec:
     rmse_threshold: float = 0.4
     max_deg_threshold: Optional[float] = 20.0
     max_n_ulp: int = 8
-    modes: tuple[UlpNoiseMode, ...] = (
-        UlpNoiseMode.RANDOM,
-        UlpNoiseMode.PLUS,
-        UlpNoiseMode.MINUS,
-    )
 
 
 def matvec_format_grid(
