@@ -94,7 +94,6 @@ class QuantLinear(nn.Module):
             y_mm = inject_ulp_noise(
                 y_mm,
                 n_ulp=self.ulp_noise.n_ulp,
-                mode=self.ulp_noise.mode,
                 ulp_fmt=self.ulp_noise.ulp_fmt,
             )
         y_accum = y_mm if b_q is None else (y_mm + b_q)
@@ -189,7 +188,6 @@ class QuantLinearMatVec(nn.Module):
             y_mm = inject_ulp_noise(
                 y_mm,
                 n_ulp=self.ulp_noise.n_ulp,
-                mode=self.ulp_noise.mode,
                 ulp_fmt=self.ulp_noise.ulp_fmt,
             )
 

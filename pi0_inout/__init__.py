@@ -41,7 +41,7 @@ from .model_patcher import (
     patch_attn_sdpa, unpatch_attn_sdpa,
 )
 from .stats_tracker import StatsTracker, Component, StatsReport
-from .ulp_noise import UlpNoiseConfig, UlpNoiseMode, ulp_step, inject_ulp_noise
+from .ulp_noise import UlpNoiseConfig, ulp_step, inject_ulp_noise
 from .eval_harness  import (
     QuantConfig,
     MatVecQuantConfig,
@@ -81,7 +81,6 @@ __all__ = [
     "unpatch_attn_sdpa",
     # ULP utilities
     "UlpNoiseConfig",
-    "UlpNoiseMode",
     "ulp_step",
     "inject_ulp_noise",
     # Stats

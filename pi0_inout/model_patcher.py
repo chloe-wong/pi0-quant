@@ -331,6 +331,18 @@ def unpatch_model(model: nn.Module) -> nn.Module:
     return model
 
 
+def set_ulp_noise(model: nn.Module, ulp_noise: Optional[UlpNoiseConfig]) -> None:
+    """
+    Update the ULP-noise configuration on all patched Linear layers in-place.
+
+    This enables changing ULP injection at runtime (without re-patching), as long
+    as the model has already been patched with QuantLinear / QuantLinearMatVec.
+    """
+    for _, module in model.named_modules():
+        if isinstance(module, (QuantLinear, QuantLinearMatVec)):
+            module.ulp_noise = ulp_noise
+
+
 # ---------------------------------------------------------------------------
 # Helpers: module tree traversal
 # ---------------------------------------------------------------------------

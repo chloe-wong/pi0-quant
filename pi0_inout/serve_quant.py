@@ -77,12 +77,13 @@ import torch.nn as nn
 # ── pi0_inout imports (quantization layer) ────────────────────────────────────
 from pi0_inout.quant_types import QuantFormat, TORCH_DTYPE, FORMAT_BITS, set_fp8_mode
 from pi0_inout.model_patcher import (
-    patch_model, list_linear_layers,
+    patch_model, patch_model_matvec, list_linear_layers,
     QuantGroup, ALL_GROUPS,
     patch_attn_sdpa, unpatch_attn_sdpa,
 )
 from pi0_inout.quant_linear import QuantLinear
 from pi0_inout.stats_tracker import StatsTracker
+from pi0_inout.ulp_noise import UlpNoiseConfig
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +571,7 @@ class Pi0PyTorchPolicy:
         )
 
         with torch.no_grad():
-            actions = self.model.sample_actions(str(dev), obs_ns, num_steps=10)
+            actions = self.model.sample_actions(str(dev), obs_ns, noise=noise, num_steps=10)
         # actions: [1, action_horizon, 32]  (normalized action space)
         actions = actions.squeeze(0).cpu().numpy()  # (horizon, 32)
 

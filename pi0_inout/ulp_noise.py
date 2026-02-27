@@ -20,7 +20,6 @@ where emin is the minimum normal exponent for the format.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from typing import Optional
 
 import torch
@@ -28,16 +27,9 @@ import torch
 from .quant_types import QuantFormat
 
 
-class UlpNoiseMode(str, Enum):
-    RANDOM = "random"  # random ±
-    PLUS = "plus"      # always +ULP
-    MINUS = "minus"    # always -ULP
-
-
 @dataclass(frozen=True)
 class UlpNoiseConfig:
     n_ulp: int = 0
-    mode: UlpNoiseMode = UlpNoiseMode.RANDOM
     ulp_fmt: QuantFormat = QuantFormat.FLOAT16  # format whose ULP grid defines the step size
 
     def enabled(self) -> bool:
@@ -81,8 +73,10 @@ def ulp_step(x: torch.Tensor, fmt: QuantFormat) -> torch.Tensor:
     finite = torch.isfinite(x_f32)
 
     # min_normal = 2**emin
-    min_normal = torch.ldexp(torch.ones((), device=x_f32.device, dtype=torch.float32), emin)
-    ulp_sub = torch.ldexp(torch.ones((), device=x_f32.device, dtype=torch.float32), emin - frac_bits)
+    exp_emin = torch.tensor(emin, device=x_f32.device, dtype=torch.int32)
+    exp_sub = torch.tensor(emin - frac_bits, device=x_f32.device, dtype=torch.int32)
+    min_normal = torch.ldexp(torch.ones((), device=x_f32.device, dtype=torch.float32), exp_emin)
+    ulp_sub = torch.ldexp(torch.ones((), device=x_f32.device, dtype=torch.float32), exp_sub)
 
     # torch.frexp: ax = m * 2**exp, m in [0.5, 1) for ax>0
     m, exp = torch.frexp(ax)
@@ -100,9 +94,7 @@ def inject_ulp_noise(
     y: torch.Tensor,
     *,
     n_ulp: int,
-    mode: UlpNoiseMode,
     ulp_fmt: QuantFormat,
-    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """
     Add ±n_ulp * ULP(y, ulp_fmt) to y.
@@ -116,23 +108,6 @@ def inject_ulp_noise(
 
     y_f32 = y.float()
     step = ulp_step(y_f32, ulp_fmt)
-
-    if mode == UlpNoiseMode.PLUS:
-        sign = 1.0
-    elif mode == UlpNoiseMode.MINUS:
-        sign = -1.0
-    elif mode == UlpNoiseMode.RANDOM:
-        # Sample in {+1, -1} with equal probability.
-        r = torch.randint(
-            low=0,
-            high=2,
-            size=y_f32.shape,
-            device=y_f32.device,
-            generator=generator,
-        )
-        sign = (r * 2 - 1).to(torch.float32)
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
 
     return (y_f32 + (float(n_ulp) * step * sign)).to(y.dtype)
 
