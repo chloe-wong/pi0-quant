@@ -170,6 +170,59 @@ python pi0_inout/serve_quant.py \
     --gpu 0
 ```
 
+## ULP sweep (two servers)
+
+`run_ulp_sweep_two_servers.py` compares a **base server** vs a **quantized server** over the same randomly generated observations, and sweeps `--ulp-n` on the quantized side.
+
+### Typical usage
+
+- Start a base server (no ULP noise) on some port
+- Run the sweep, letting it (re)launch the quantized (with ULP noise) server each step:
+
+```bash
+python -m pi0_inout.run_ulp_sweep_two_servers \
+    --base-port 8000 \
+    --quantized-port 8001 \
+    --start-ulp-n 0 --ulp-step 50 --max-ulp-n 5000 \
+    --quantized-server-cmd 'env CUDA_VISIBLE_DEVICES=2 python pi0_inout/serve_quant.py --openpi-dir /path/to/openpi --checkpoint-dir /path/to/checkpoint --config pi0_droid --gpu 0 --input-fmt float8_e5m2 --output-fmt bfloat16 --ulp-fmt bfloat16'
+```
+
+If you omit `--quantized-server-cmd`, the script will **evaluate whatever is already running** on `--quantized-port` (single step).
+
+### Options
+
+- **server endpoints**
+  - `--base-host` (default `127.0.0.1`)
+  - `--base-port` (default `8000`)
+  - `--quantized-host` (default `127.0.0.1`)
+  - `--quantized-port` (default `8001`)
+- **sweep controls**
+  - `--start-ulp-n` (default `1`)
+  - `--ulp-step` (default `1`)
+  - `--max-ulp-n` (default `32`)
+  - `--rmse-threshold` (default `0.4`, stops when `rmse >= threshold`)
+  - `--ready-timeout-s` (default `60.0`)
+  - `--n-obs` (default `16`)
+  - `--seed` (default `0`)
+- **quantized-server management**
+  - `--quantized-server-cmd`: command template used to (re)start the quantized server for each step
+  - `--dynamic-ulp`: do not restart the quantized server; instead send a `__quant_control__` update (requires server support)
+  - `--kill-existing-quantized-server` / `--no-kill-existing-quantized-server` (default: kill)
+- **misc**
+  - `--ulp-fmt`: reporting format (defaults to inferred base-server metadata: `ulp_fmt → output_fmt → bfloat16`)
+  - `--use-fixed-pi0-noise`: inject deterministic `obs["pi0_noise"]` (requires server to consume it)
+  - `--log-dir`: where step logs go (default `./ulp_sweep_logs`)
+
+### `--quantized-server-cmd` placeholders
+
+The sweep performs simple string replacement on these placeholders before launching the quantized server:
+
+- `{ulp_n}`
+- `{quantized_port}`
+- `{input_fmt}`, `{output_fmt}`
+- `{ulp_fmt}`
+- `{mat_in_fmt}`, `{mat_out_fmt}`, `{vec_out_fmt}`
+
 ## Full benchmark sweep
 
 `run_benchmark.py` orchestrates a sweep of all 25 format pairs, spawning

@@ -109,5 +109,12 @@ def inject_ulp_noise(
     y_f32 = y.float()
     step = ulp_step(y_f32, ulp_fmt)
 
+    # Random ± noise per element (symmetric, unbiased in expectation).
+    # Keep it stateless (no explicit RNG plumbing) since serve_quant is a long-running server.
+    sign = torch.where(
+        torch.rand_like(step) < 0.5,
+        torch.tensor(-1.0, device=step.device, dtype=step.dtype),
+        torch.tensor(1.0, device=step.device, dtype=step.dtype),
+    )
     return (y_f32 + (float(n_ulp) * step * sign)).to(y.dtype)
 

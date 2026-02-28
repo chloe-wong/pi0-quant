@@ -3,8 +3,8 @@ run_ulp_sweep_two_servers.py
 ----------------------------
 Automate an ULP-noise sweep using two policy servers:
 
-  - base server (no noise), already running (default port 8000)
-  - quantized server, (re)started per sweep step with --ulp-n = 1,2,3,... (default port 8002)
+  - base server, already running (default port 8000)
+  - quantized server, optionally (re)started per sweep step with --ulp-n = 1,2,3,... (default port 8002)
 
 For each n:
   - query both servers on the same set of observations
@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Optional
@@ -29,12 +30,12 @@ from typing import IO, Any, Optional
 import numpy as np
 import torch
 
-from openpi_client import websocket_client_policy as _ws
-
 # Allow running as a script: ensure repo root is on sys.path.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+from openpi_client import websocket_client_policy as _ws
 
 from pi0_inout.quant_types import QuantFormat
 
@@ -71,9 +72,9 @@ def _to_actions_tensor(resp: dict) -> torch.Tensor:
     return t.reshape(-1)
 
 
-def _metrics(ref: list[torch.Tensor], noisy: list[torch.Tensor]) -> Metrics:
-    r = torch.cat(ref, dim=0)
-    n = torch.cat(noisy, dim=0)
+def _metrics(base: list[torch.Tensor], quantized: list[torch.Tensor]) -> Metrics:
+    r = torch.cat(base, dim=0)
+    n = torch.cat(quantized, dim=0)
     diff = (r - n).abs()
 
     rmse = math.sqrt(float(diff.pow(2).mean().item()))
@@ -148,25 +149,113 @@ def _stop_proc_tree(proc: subprocess.Popen) -> None:
             return
         proc.wait(timeout=15)
 
-def _start_noise_server(
-    noise_cmd_template: str,
+
+def _pids_listening_on_port(port: int) -> set[int]:
+    """
+    Best-effort: find PIDs that have a TCP LISTEN socket bound to `port`.
+
+    Linux-only implementation without external deps (no psutil/lsof).
+    """
+
+    def _listen_inodes_from(path: str) -> set[str]:
+        inodes: set[str] = set()
+        with open(path, "r", encoding="utf-8") as f:
+            next(f, None)  # header
+            for line in f:
+                parts = line.split()
+                if len(parts) < 10:
+                    continue
+                local_address = parts[1]  # "0100007F:1F41"
+                st = parts[3]  # "0A" is LISTEN
+                inode = parts[9]
+                if st != "0A":
+                    continue
+                try:
+                    _ip_hex, port_hex = local_address.split(":")
+                    p = int(port_hex, 16)
+                except Exception:
+                    continue
+                if p == port:
+                    inodes.add(inode)
+        return inodes
+
+    inodes: set[str] = set()
+    with suppress(FileNotFoundError, PermissionError):
+        inodes |= _listen_inodes_from("/proc/net/tcp")
+    with suppress(FileNotFoundError, PermissionError):
+        inodes |= _listen_inodes_from("/proc/net/tcp6")
+    if not inodes:
+        return set()
+
+    pids: set[int] = set()
+    for pid_str in os.listdir("/proc"):
+        if not pid_str.isdigit():
+            continue
+        pid = int(pid_str)
+        fd_dir = f"/proc/{pid_str}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except (FileNotFoundError, PermissionError):
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            if target.startswith("socket:[") and target.endswith("]"):
+                inode = target[len("socket:[") : -1]
+                if inode in inodes:
+                    pids.add(pid)
+                    break
+    return pids
+
+
+def _kill_listeners_on_port(port: int, *, timeout_s: float = 10.0) -> None:
+    """
+    Best-effort: terminate any processes currently LISTENing on `port`.
+
+    This is useful when you keep a quantized server running manually before a sweep:
+    without freeing the port, the sweep may keep querying the old server while the
+    newly launched one is still loading.
+    """
+    pids = _pids_listening_on_port(port)
+    if not pids:
+        return
+
+    for pid in pids:
+        with suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGTERM)
+
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        if not _pids_listening_on_port(port):
+            return
+        time.sleep(0.1)
+
+    for pid in _pids_listening_on_port(port):
+        with suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def _start_quantized_server(
+    quantized_server_cmd_template: str,
     *,
     ulp_n: int,
-    noise_port: int,
+    quantized_port: int,
     defaults: dict[str, Any],
     stdout: Optional[IO[str]] = None,
 ) -> subprocess.Popen:
     """
-    Start the noise server for the given ulp_n.
+    Start the quantized server for the given ulp_n.
 
     The template is a shell-ish command string. If it contains '{ulp_n}', it will be replaced.
     Otherwise '--ulp-n <n>' will be appended.
     """
     cmd_str = _replace_placeholders(
-        noise_cmd_template,
+        quantized_server_cmd_template,
         {
             "ulp_n": ulp_n,
-            "noise_port": noise_port,
+            "quantized_port": quantized_port,
             "input_fmt": defaults.get("input_fmt"),
             "output_fmt": defaults.get("output_fmt"),
             "ulp_fmt": defaults.get("ulp_fmt"),
@@ -179,9 +268,9 @@ def _start_noise_server(
 
     # Always enforce the sweep value + port.
     _argv_set_kv(argv, "--ulp-n", str(ulp_n))
-    _argv_set_kv(argv, "--port", str(noise_port))
+    _argv_set_kv(argv, "--port", str(quantized_port))
 
-    # If the template omits these, auto-fill from defaults (usually ref server).
+    # If the template omits these, auto-fill from defaults (usually base server).
     if defaults.get("use_matvec"):
         if not _argv_has(argv, "--use-matvec"):
             argv.append("--use-matvec")
@@ -221,10 +310,10 @@ def _open_step_log(*, log_dir: Path, tag: str) -> IO[str]:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--base-host", "--ref-host", default="127.0.0.1")
-    p.add_argument("--base-port", "--ref-port", type=int, default=8000)
-    p.add_argument("--quantized-host", "--noise-host", default="127.0.0.1")
-    p.add_argument("--quantized-port", "--noise-port", type=int, default=8002)
+    p.add_argument("--base-host", default="127.0.0.1")
+    p.add_argument("--base-port", type=int, default=8000)
+    p.add_argument("--quantized-host", default="127.0.0.1")
+    p.add_argument("--quantized-port", type=int, default=8002)
 
     p.add_argument("--n-obs", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
@@ -232,7 +321,7 @@ def main() -> None:
         "--ulp-fmt",
         default=None,
         choices=[f.value for f in QuantFormat],
-        help="Format used to compute ULP(ref) for reporting. If unset, inferred from ref server metadata (ulp_fmt → output_fmt → bfloat16).",
+        help="Format used to compute ULP(base) for reporting. If unset, inferred from base server metadata (ulp_fmt → output_fmt → bfloat16).",
     )
     p.add_argument("--rmse-threshold", type=float, default=0.4)
     p.add_argument("--start-ulp-n", type=int, default=1,
@@ -247,12 +336,11 @@ def main() -> None:
                    help="Directory to write per-step log files (created if missing). Relative paths are rooted at repo root.")
 
     p.add_argument(
-        "--quantized-cmd",
-        "--noise-cmd",
+        "--quantized-server-cmd",
         default=None,
         help=(
             "If set, the script will (re)start the quantized server for each ulp_n. "
-            "You may use placeholders like '{ulp_n}', '{noise_port}', '{input_fmt}', '{output_fmt}', '{ulp_fmt}', "
+            "You may use placeholders like '{ulp_n}', '{quantized_port}', '{input_fmt}', '{output_fmt}', '{ulp_fmt}', "
             "'{mat_in_fmt}', '{mat_out_fmt}', '{vec_out_fmt}'. "
             "If you omit format/ulp flags entirely, they will be auto-filled from the base server's metadata (falling back to bfloat16)."
         ),
@@ -261,7 +349,17 @@ def main() -> None:
     p.add_argument(
         "--dynamic-ulp",
         action="store_true",
-        help="If set, do NOT restart the noise server. Instead, send a control key '__quant_control__' to update ULP at runtime (requires updated serve_quant.py).",
+        help="If set, do NOT restart the quantized server. Instead, send a control key '__quant_control__' to update ULP at runtime (requires updated serve_quant.py).",
+    )
+    p.add_argument(
+        "--kill-existing-quantized-server",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If true (default), kill any existing process listening on --quantized-port "
+            "before starting a new quantized server step. This is recommended if you "
+            "start a quantized server manually before running the sweep."
+        ),
     )
     args = p.parse_args()
 
@@ -286,7 +384,7 @@ def main() -> None:
     run_log.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
     run_log.write(f"# sweep: start_ulp_n={start_ulp_n}  ulp_step={ulp_step}  max_ulp_n={max_ulp_n}\n")
     run_log.write(f"# use_fixed_pi0_noise={bool(args.use_fixed_pi0_noise)}\n")
-    run_log.write(f"# quantized_cmd={args.quantized_cmd}\n\n")
+    run_log.write(f"# quantized_server_cmd={args.quantized_server_cmd}\n\n")
     if base_q:
         run_log.write(f"# base_quant={base_q}\n\n")
     run_log.flush()
@@ -304,18 +402,20 @@ def main() -> None:
             obs = _with_fixed_pi0_noise(obs, rng=rng, action_shape=action_shape)
         observations.append(obs)
 
-    noise_proc: Optional[subprocess.Popen] = None
-    noise_log_fh: Optional[IO[str]] = None
+    quantized_proc: Optional[subprocess.Popen] = None
+    quantized_log_fh: Optional[IO[str]] = None
     try:
-        # If using dynamic updates and a command template is provided, start the noise server once at ulp_n=0.
-        if args.dynamic_ulp and args.quantized_cmd:
-            step_tag = "noise_server_start"
-            noise_log_fh = _open_step_log(log_dir=run_dir, tag=step_tag)
-            noise_log_fh.write(f"# {step_tag}\n")
-            noise_log_fh.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
-            noise_log_fh.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
-            noise_log_fh.write(f"# quantized_cmd={args.quantized_cmd}\n\n")
-            noise_log_fh.flush()
+        # If using dynamic updates and a command template is provided, start the quantized server once at ulp_n=0.
+        if args.dynamic_ulp and args.quantized_server_cmd:
+            if args.kill_existing_quantized_server:
+                _kill_listeners_on_port(args.quantized_port)
+            step_tag = "quantized_server_start"
+            quantized_log_fh = _open_step_log(log_dir=run_dir, tag=step_tag)
+            quantized_log_fh.write(f"# {step_tag}\n")
+            quantized_log_fh.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
+            quantized_log_fh.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
+            quantized_log_fh.write(f"# quantized_server_cmd={args.quantized_server_cmd}\n\n")
+            quantized_log_fh.flush()
 
             defaults = {
                 "input_fmt": base_q.get("input_fmt", "bfloat16"),
@@ -326,36 +426,38 @@ def main() -> None:
                 "vec_out_fmt": base_q.get("vec_out_fmt", "bfloat16"),
                 "ulp_fmt": base_q.get("ulp_fmt") or base_q.get("output_fmt") or "bfloat16",
             }
-            noise_proc = _start_noise_server(
-                args.quantized_cmd,
+            quantized_proc = _start_quantized_server(
+                args.quantized_server_cmd,
                 ulp_n=0,
-                noise_port=args.quantized_port,
+                quantized_port=args.quantized_port,
                 defaults=defaults,
-                stdout=noise_log_fh,
+                stdout=quantized_log_fh,
             )
 
         for n in range(start_ulp_n, max_ulp_n + 1, ulp_step):
-            if args.quantized_cmd is None:
-                # Evaluate whatever is already running on noise-port (single step).
+            if args.quantized_server_cmd is None:
+                # Evaluate whatever is already running on quantized-port (single step).
                 n = -1
             elif not args.dynamic_ulp:
                 # Restart-per-step mode.
-                if noise_proc is not None and noise_proc.poll() is None:
-                    _stop_proc_tree(noise_proc)
-                if noise_log_fh is not None:
-                    noise_log_fh.close()
-                    noise_log_fh = None
+                if quantized_proc is not None and quantized_proc.poll() is None:
+                    _stop_proc_tree(quantized_proc)
+                if args.kill_existing_quantized_server:
+                    _kill_listeners_on_port(args.quantized_port)
+                if quantized_log_fh is not None:
+                    quantized_log_fh.close()
+                    quantized_log_fh = None
 
                 step_tag = f"ulp_n={n}"
-                noise_log_fh = _open_step_log(log_dir=run_dir, tag=step_tag)
-                noise_log_fh.write(f"# {step_tag}\n")
-                noise_log_fh.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
-                noise_log_fh.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
-                noise_log_fh.write(f"# use_fixed_pi0_noise={bool(args.use_fixed_pi0_noise)}\n")
-                noise_log_fh.write(f"# quantized_cmd={args.quantized_cmd}\n\n")
+                quantized_log_fh = _open_step_log(log_dir=run_dir, tag=step_tag)
+                quantized_log_fh.write(f"# {step_tag}\n")
+                quantized_log_fh.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
+                quantized_log_fh.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
+                quantized_log_fh.write(f"# use_fixed_pi0_noise={bool(args.use_fixed_pi0_noise)}\n")
+                quantized_log_fh.write(f"# quantized_server_cmd={args.quantized_server_cmd}\n\n")
                 if base_q:
-                    noise_log_fh.write(f"# base_quant={base_q}\n\n")
-                noise_log_fh.flush()
+                    quantized_log_fh.write(f"# base_quant={base_q}\n\n")
+                quantized_log_fh.flush()
 
                 defaults = {
                     "input_fmt": base_q.get("input_fmt", "bfloat16"),
@@ -366,25 +468,25 @@ def main() -> None:
                     "vec_out_fmt": base_q.get("vec_out_fmt", "bfloat16"),
                     "ulp_fmt": base_q.get("ulp_fmt") or base_q.get("output_fmt") or "bfloat16",
                 }
-                noise_proc = _start_noise_server(
-                    args.quantized_cmd,
+                quantized_proc = _start_quantized_server(
+                    args.quantized_server_cmd,
                     ulp_n=n,
-                    noise_port=args.quantized_port,
+                    quantized_port=args.quantized_port,
                     defaults=defaults,
-                    stdout=noise_log_fh,
+                    stdout=quantized_log_fh,
                 )
 
-            if args.quantized_cmd is None and noise_log_fh is None:
+            if args.quantized_server_cmd is None and quantized_log_fh is None:
                 step_tag = "ulp_n=as-is"
-                noise_log_fh = _open_step_log(log_dir=run_dir, tag=step_tag)
-                noise_log_fh.write(f"# {step_tag}\n")
-                noise_log_fh.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
-                noise_log_fh.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
-                noise_log_fh.write(f"# use_fixed_pi0_noise={bool(args.use_fixed_pi0_noise)}\n")
-                noise_log_fh.write(f"# noise_cmd=None (evaluate existing server)\n\n")
+                quantized_log_fh = _open_step_log(log_dir=run_dir, tag=step_tag)
+                quantized_log_fh.write(f"# {step_tag}\n")
+                quantized_log_fh.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
+                quantized_log_fh.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
+                quantized_log_fh.write(f"# use_fixed_pi0_noise={bool(args.use_fixed_pi0_noise)}\n")
+                quantized_log_fh.write(f"# quantized_server_cmd=None (evaluate existing server)\n\n")
                 if base_q:
-                    noise_log_fh.write(f"# base_quant={base_q}\n\n")
-                noise_log_fh.flush()
+                    quantized_log_fh.write(f"# base_quant={base_q}\n\n")
+                quantized_log_fh.flush()
 
             quantized = _ws.WebsocketClientPolicy(host=args.quantized_host, port=args.quantized_port)
             _wait_until_ready(quantized, obs0, timeout_s=args.ready_timeout_s)
@@ -411,22 +513,22 @@ def main() -> None:
             print(line)
             run_log.write(line + "\n")
             run_log.flush()
-            if noise_log_fh is not None:
-                noise_log_fh.write(f"\n# result: {line}\n")
-                noise_log_fh.flush()
+            if quantized_log_fh is not None:
+                quantized_log_fh.write(f"\n# result: {line}\n")
+                quantized_log_fh.flush()
 
             if n >= 0 and m.rmse >= args.rmse_threshold:
                 print(f"STOP: threshold violated (rmse >= {args.rmse_threshold})")
                 break
 
-            if args.quantized_cmd is None:
+            if args.quantized_server_cmd is None:
                 break
     finally:
         run_log.close()
-        if noise_proc is not None and noise_proc.poll() is None:
-            _stop_proc_tree(noise_proc)
-        if noise_log_fh is not None:
-            noise_log_fh.close()
+        if quantized_proc is not None and quantized_proc.poll() is None:
+            _stop_proc_tree(quantized_proc)
+        if quantized_log_fh is not None:
+            quantized_log_fh.close()
 
 
 if __name__ == "__main__":

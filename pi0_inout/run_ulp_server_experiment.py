@@ -44,16 +44,6 @@ def _random_observation_droid(rng: np.random.Generator) -> dict:
     }
 
 
-def _add_fixed_noise(obs: dict, rng: np.random.Generator, action_shape: tuple[int, ...]) -> dict:
-    """
-    Add deterministic diffusion noise so two servers produce identical outputs
-    when they run the same model/config (sanity check).
-    """
-    out = dict(obs)
-    out["pi0_noise"] = rng.standard_normal(action_shape).astype(np.float32)
-    return out
-
-
 @dataclass(frozen=True)
 class Metrics:
     rmse: float
@@ -74,25 +64,6 @@ def _metrics(base: list[torch.Tensor], quantized: list[torch.Tensor]) -> Metrics
 
     rmse = math.sqrt(float(diff.pow(2).mean().item()))
     return Metrics(rmse=rmse)
-
-
-def _quant_summary(policy: _ws.WebsocketClientPolicy) -> str:
-    """
-    Summarize quant config advertised by the server on websocket connect.
-    Requires serve_quant.py to provide metadata["quant"].
-    """
-    try:
-        md = policy.get_server_metadata() or {}
-    except Exception:
-        md = {}
-    q = md.get("quant", {})
-    if not isinstance(q, dict):
-        q = {}
-    input_fmt = q.get("input_fmt", "?")
-    output_fmt = q.get("output_fmt", "?")
-    ulp_n = q.get("ulp_n", "?")
-    ulp_fmt = q.get("ulp_fmt", "?")
-    return f"in={input_fmt} out={output_fmt} ulp_n={ulp_n} ulp_fmt={ulp_fmt}"
 
 
 def main() -> None:
