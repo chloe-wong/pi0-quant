@@ -46,7 +46,7 @@ def _random_observation_droid(rng: np.random.Generator) -> dict:
         "observation/wrist_image_left": rng.integers(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/joint_position": rng.random(7, dtype=np.float32),
         "observation/gripper_position": rng.random(1, dtype=np.float32),
-        "prompt": "Grab the object"
+        "prompt": "Grab the object" # can change
     }
 
 
@@ -97,7 +97,7 @@ def _wait_until_ready(policy: _ws.WebsocketClientPolicy, obs: dict, *, timeout_s
 
 def _quant_cfg(policy: _ws.WebsocketClientPolicy) -> dict[str, Any]:
     """
-    Best-effort extraction of quantization config from server metadata.
+    Extract quantization config from server metadata.
     `serve_quant.py` sends a top-level 'quant' dict on connect.
     """
     try:
@@ -212,7 +212,7 @@ def _pids_listening_on_port(port: int) -> set[int]:
 
 def _kill_listeners_on_port(port: int, *, timeout_s: float = 10.0) -> None:
     """
-    Best-effort: terminate any processes currently LISTENing on `port`.
+    Terminate processes currently LISTENing on `port`.
 
     This is useful when you keep a quantized server running manually before a sweep:
     without freeing the port, the sweep may keep querying the old server while the
@@ -347,11 +347,6 @@ def main() -> None:
     )
 
     p.add_argument(
-        "--dynamic-ulp",
-        action="store_true",
-        help="If set, do NOT restart the quantized server. Instead, send a control key '__quant_control__' to update ULP at runtime (requires updated serve_quant.py).",
-    )
-    p.add_argument(
         "--kill-existing-quantized-server",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -405,40 +400,11 @@ def main() -> None:
     quantized_proc: Optional[subprocess.Popen] = None
     quantized_log_fh: Optional[IO[str]] = None
     try:
-        # If using dynamic updates and a command template is provided, start the quantized server once at ulp_n=0.
-        if args.dynamic_ulp and args.quantized_server_cmd:
-            if args.kill_existing_quantized_server:
-                _kill_listeners_on_port(args.quantized_port)
-            step_tag = "quantized_server_start"
-            quantized_log_fh = _open_step_log(log_dir=run_dir, tag=step_tag)
-            quantized_log_fh.write(f"# {step_tag}\n")
-            quantized_log_fh.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
-            quantized_log_fh.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
-            quantized_log_fh.write(f"# quantized_server_cmd={args.quantized_server_cmd}\n\n")
-            quantized_log_fh.flush()
-
-            defaults = {
-                "input_fmt": base_q.get("input_fmt", "bfloat16"),
-                "output_fmt": base_q.get("output_fmt", "bfloat16"),
-                "use_matvec": bool(base_q.get("use_matvec", False)),
-                "mat_in_fmt": base_q.get("mat_in_fmt", "bfloat16"),
-                "mat_out_fmt": base_q.get("mat_out_fmt", "bfloat16"),
-                "vec_out_fmt": base_q.get("vec_out_fmt", "bfloat16"),
-                "ulp_fmt": base_q.get("ulp_fmt") or base_q.get("output_fmt") or "bfloat16",
-            }
-            quantized_proc = _start_quantized_server(
-                args.quantized_server_cmd,
-                ulp_n=0,
-                quantized_port=args.quantized_port,
-                defaults=defaults,
-                stdout=quantized_log_fh,
-            )
-
         for n in range(start_ulp_n, max_ulp_n + 1, ulp_step):
             if args.quantized_server_cmd is None:
                 # Evaluate whatever is already running on quantized-port (single step).
                 n = -1
-            elif not args.dynamic_ulp:
+            else:
                 # Restart-per-step mode.
                 if quantized_proc is not None and quantized_proc.poll() is None:
                     _stop_proc_tree(quantized_proc)
@@ -466,7 +432,7 @@ def main() -> None:
                     "mat_in_fmt": base_q.get("mat_in_fmt", "bfloat16"),
                     "mat_out_fmt": base_q.get("mat_out_fmt", "bfloat16"),
                     "vec_out_fmt": base_q.get("vec_out_fmt", "bfloat16"),
-                    "ulp_fmt": base_q.get("ulp_fmt") or base_q.get("output_fmt") or "bfloat16",
+                    "ulp_fmt": base_q.get("ulp_fmt") or "bfloat16",
                 }
                 quantized_proc = _start_quantized_server(
                     args.quantized_server_cmd,
@@ -495,17 +461,7 @@ def main() -> None:
             quantized_actions: list[torch.Tensor] = []
             for i, obs in enumerate(observations):
                 base_actions.append(_to_actions_tensor(base.infer(obs)))
-                if args.dynamic_ulp and n >= 0:
-                    # Update server-side ULP config (best-effort) on the first request of each step.
-                    o = dict(obs)
-                    if i == 0:
-                        o["__quant_control__"] = {
-                            "ulp_n": n,
-                            "ulp_fmt": eval_ulp_fmt.value,
-                        }
-                    quantized_actions.append(_to_actions_tensor(quantized.infer(o)))
-                else:
-                    quantized_actions.append(_to_actions_tensor(quantized.infer(obs)))
+                quantized_actions.append(_to_actions_tensor(quantized.infer(obs)))
 
             m = _metrics(base_actions, quantized_actions)
             tag = f"ulp_n={n}" if n >= 0 else "ulp_n=<as-is>"

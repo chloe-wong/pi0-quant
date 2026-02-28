@@ -206,7 +206,6 @@ If you omit `--quantized-server-cmd`, the script will **evaluate whatever is alr
   - `--seed` (default `0`)
 - **quantized-server management**
   - `--quantized-server-cmd`: command template used to (re)start the quantized server for each step
-  - `--dynamic-ulp`: do not restart the quantized server; instead send a `__quant_control__` update (requires server support)
   - `--kill-existing-quantized-server` / `--no-kill-existing-quantized-server` (default: kill)
 - **misc**
   - `--ulp-fmt`: reporting format (defaults to inferred base-server metadata: `ulp_fmt → output_fmt → bfloat16`)
