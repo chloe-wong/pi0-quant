@@ -469,9 +469,10 @@ class Pi0PyTorchPolicy:
         dtype = torch.float32
 
         def _img_tensor(arr: np.ndarray) -> torch.Tensor:
-            """uint8 HWC [H,W,3] → float tensor [1,3,H,W]."""
+            """uint8 HWC [H,W,3] → float tensor [1,3,H,W] in [-1, 1]."""
             t = torch.from_numpy(arr.copy()).to(dev)
             t = t.permute(2, 0, 1).unsqueeze(0).to(dtype)
+            t = t / 255.0 * 2.0 - 1.0  # uint8 [0,255] → [-1, 1]
             return t
 
         H, W = 224, 224
