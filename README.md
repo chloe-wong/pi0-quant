@@ -172,7 +172,7 @@ python pi0_inout/serve_quant.py \
 
 ## ULP sweep (two servers)
 
-`run_ulp_sweep_two_servers.py` compares a **base server** vs a **quantized server** over the same randomly generated observations, and sweeps `--ulp-n` on the quantized side.
+`run_ulp_sweep_two_servers.py` compares a **base server** vs a **quantized server** over the same randomly generated observations, and sweeps `--ulp-n` on the quantized side. Base server and quantized server must be run on **different CUDA_VISIBLE_DEVICES** as each server is quite heavy to run.
 
 ### Typical usage
 
@@ -281,7 +281,7 @@ python pi0_inout/run_matvec_ulp_sweep.py \
 | `--ulp-step` | `1` | Increment per sweep step (e.g. `10` → 10, 20, 30 …) |
 | `--n-obs` | `16` | Random DROID observations per combo |
 | `--seed` | `0` | RNG seed |
-| `--rmse-threshold` | `0.4` |
+| `--rmse-threshold` | `0.4` | Max rmse threshold default = 0.4 |
 | `--ready-timeout` | `120.0` | Seconds to wait for each server to become ready |
 | `--resume` | off | Skip combos whose `results.json` already exists |
 | `--openpi-dir` | `./openpi` | Override path to openpi repo root |
