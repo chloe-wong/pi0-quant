@@ -47,6 +47,7 @@ from typing import IO, Optional
 logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent
 
 # Reduced formats to sweep (no FP32 — that is the base reference)
 SWEEP_FORMATS = ["float8_e4m3", "float8_e5m2", "float16", "bfloat16"]
@@ -186,6 +187,10 @@ def _start_base_server(
     env = os.environ.copy()
     if openpi_dir:
         env["OPENPI_DIR"] = str(openpi_dir)
+    # Pin base server to its own GPU so it doesn't share with quantized server
+    if "CUDA_VISIBLE_DEVICES" not in env:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    cmd[cmd.index("--gpu") + 1] = "0"
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = log_path.open("w")
@@ -225,15 +230,17 @@ def _build_quant_server_template(
         "--config",         config,
         "--checkpoint-dir", checkpoint_dir,
         "--port",           "{quantized_port}",
-        "--gpu",            str(gpu),
+        "--gpu",            "0",   # with CUDA_VISIBLE_DEVICES={gpu}, only one GPU visible
         "--input-fmt",      input_fmt,
         "--output-fmt",     output_fmt,
-        "--ulp-fmt",        output_fmt,   # calibrate noise to output grid
+        "--ulp-fmt",        output_fmt,
         "--ulp-n",          "{ulp_n}",
     ]
     if openpi_dir:
         parts += ["--openpi-dir", openpi_dir]
-    return " ".join(parts)
+    cmd_str = " ".join(parts)
+    # Pin quantized server to its own GPU
+    return f"env CUDA_VISIBLE_DEVICES={gpu} {cmd_str}"
 
 
 def _run_combo_sweep(
@@ -254,6 +261,7 @@ def _run_combo_sweep(
     config: str,
     gpu_quant: int,
     openpi_dir: Optional[str],
+    use_fixed_pi0_noise: bool,
     log_fh: IO[str],
 ) -> list[dict]:
     """
@@ -280,6 +288,7 @@ def _run_combo_sweep(
         "--quantized-port",     str(quantized_port),
         "--n-obs",              str(n_obs),
         "--seed",               str(seed),
+        "--start-ulp-n",        "0",
         "--max-ulp-n",          str(max_ulp_n),
         "--ulp-step",           str(ulp_step),
         "--rmse-threshold",     str(rmse_threshold),
@@ -288,6 +297,8 @@ def _run_combo_sweep(
         "--kill-existing-quantized-server",   # always clean up before each ulp_n step
         "--quantized-server-cmd", template,
     ]
+    if use_fixed_pi0_noise:
+        cmd.append("--use-fixed-pi0-noise")
 
     label = combo_label(input_fmt, output_fmt)
     msg = f"\n[combo {label}] Running sweep..."
@@ -529,6 +540,7 @@ def main() -> None:
     # ── Clear both ports before starting anything ────────────────────────
     _kill_listeners_on_port(args.base_port)
     _kill_listeners_on_port(args.quantized_port)
+    openpi_dir = args.openpi_dir or str(_REPO_ROOT / "openpi")
     base_log = run_dir / "base_server.log"
     base_proc = _start_base_server(  # bfloat16 reference, no ULP noise
         python=python,
@@ -536,7 +548,7 @@ def main() -> None:
         config=args.config,
         port=args.base_port,
         gpu=args.gpu_base,
-        openpi_dir=args.openpi_dir,
+        openpi_dir=openpi_dir,
         log_path=base_log,
     )
     logger.info("Waiting for base server on port %d...", args.base_port)
@@ -581,7 +593,8 @@ def main() -> None:
                 checkpoint_dir=args.checkpoint_dir,
                 config=args.config,
                 gpu_quant=args.gpu_quant,
-                openpi_dir=args.openpi_dir,
+                openpi_dir=openpi_dir,
+                use_fixed_pi0_noise=args.use_fixed_pi0_noise,
                 log_fh=run_log_fh,
             )
 
@@ -659,7 +672,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gpu-quant", type=int, default=1, help="CUDA device for quantized server")
     p.add_argument("--n-obs",      type=int,   default=16,  help="Observations per combo")
     p.add_argument("--seed",       type=int,   default=0)
-    p.add_argument("--max-ulp-n",  type=int,   default=32)
+    p.add_argument("--max-ulp-n",  type=int,   default=5000)
     p.add_argument("--ulp-step",   type=int,   default=1)
     p.add_argument("--rmse-threshold", type=float, default=0.4)
     p.add_argument("--ready-timeout",  type=float, default=120.0,
@@ -670,7 +683,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--python", default=None,
                    help="Python interpreter for servers (default: sys.executable)")
     p.add_argument("--openpi-dir", default=None,
-                   help="Path to openpi repo root (passed to serve_quant.py)")
+                   help="Path to openpi repo root (passed to serve_quant.py). Default: repo/openpi")
+    p.add_argument("--use-fixed-pi0-noise", action="store_true",
+                   help="Use deterministic pi0_noise for reproducible comparisons (default: False)")
     return p.parse_args()
 
 

@@ -15,6 +15,7 @@ For each n:
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import shlex
@@ -38,6 +39,8 @@ if str(_REPO_ROOT) not in sys.path:
 from openpi_client import websocket_client_policy as _ws
 
 from pi0_inout.quant_types import QuantFormat
+
+logger = logging.getLogger(__name__)
 
 
 def _random_observation_droid(rng: np.random.Generator) -> dict:
@@ -374,31 +377,43 @@ def main() -> None:
     run_dir = (log_root / f"run-{_timestamp_tag()}").resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     run_log = (run_dir / "run.log").open("w", encoding="utf-8")
+
+    # Warmup reference and get action shape for optional deterministic pi0_noise.
+    obs0 = _random_observation_droid(rng)
+    _wait_until_ready(base, obs0, timeout_s=args.ready_timeout_s)
+    warm = base.infer(obs0)
+    action_shape = tuple(np.asarray(warm["actions"]).shape)
+
+    use_fixed_pi0_noise = args.use_fixed_pi0_noise
+    if use_fixed_pi0_noise and (len(action_shape) != 2 or action_shape[-1] != 32):
+        logger.warning(
+            "Base server returned unexpected action_shape=%s (expected (H, 32)); "
+            "disabling use_fixed_pi0_noise to avoid shape mismatch",
+            action_shape,
+        )
+        use_fixed_pi0_noise = False
+
     run_log.write(f"# run_dir={run_dir}\n")
     run_log.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
     run_log.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
     run_log.write(f"# sweep: start_ulp_n={start_ulp_n}  ulp_step={ulp_step}  max_ulp_n={max_ulp_n}\n")
-    run_log.write(f"# use_fixed_pi0_noise={bool(args.use_fixed_pi0_noise)}\n")
+    run_log.write(f"# use_fixed_pi0_noise={bool(use_fixed_pi0_noise)}\n")
     run_log.write(f"# quantized_server_cmd={args.quantized_server_cmd}\n\n")
     if base_q:
         run_log.write(f"# base_quant={base_q}\n\n")
     run_log.flush()
 
-    # Warmup reference and get action shape for optional deterministic pi0_noise.
-    obs0 = _random_observation_droid(rng)
-    warm = base.infer(obs0)
-    action_shape = tuple(np.asarray(warm["actions"]).shape)
-
     # Pre-generate observations so each ulp_n sees identical inputs.
     observations: list[dict] = []
     for _ in range(args.n_obs):
         obs = _random_observation_droid(rng)
-        if args.use_fixed_pi0_noise:
+        if use_fixed_pi0_noise:
             obs = _with_fixed_pi0_noise(obs, rng=rng, action_shape=action_shape)
         observations.append(obs)
 
     quantized_proc: Optional[subprocess.Popen] = None
     quantized_log_fh: Optional[IO[str]] = None
+    consecutive_nan = 0
     try:
         for n in range(start_ulp_n, max_ulp_n + 1, ulp_step):
             if args.quantized_server_cmd is None:
@@ -419,7 +434,7 @@ def main() -> None:
                 quantized_log_fh.write(f"# {step_tag}\n")
                 quantized_log_fh.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
                 quantized_log_fh.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
-                quantized_log_fh.write(f"# use_fixed_pi0_noise={bool(args.use_fixed_pi0_noise)}\n")
+                quantized_log_fh.write(f"# use_fixed_pi0_noise={bool(use_fixed_pi0_noise)}\n")
                 quantized_log_fh.write(f"# quantized_server_cmd={args.quantized_server_cmd}\n\n")
                 if base_q:
                     quantized_log_fh.write(f"# base_quant={base_q}\n\n")
@@ -448,7 +463,7 @@ def main() -> None:
                 quantized_log_fh.write(f"# {step_tag}\n")
                 quantized_log_fh.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
                 quantized_log_fh.write(f"# ulp_fmt(eval)={eval_ulp_fmt.value}  n_obs={args.n_obs}  seed={args.seed}\n")
-                quantized_log_fh.write(f"# use_fixed_pi0_noise={bool(args.use_fixed_pi0_noise)}\n")
+                quantized_log_fh.write(f"# use_fixed_pi0_noise={bool(use_fixed_pi0_noise)}\n")
                 quantized_log_fh.write(f"# quantized_server_cmd=None (evaluate existing server)\n\n")
                 if base_q:
                     quantized_log_fh.write(f"# base_quant={base_q}\n\n")
@@ -476,6 +491,14 @@ def main() -> None:
             if n >= 0 and m.rmse >= args.rmse_threshold:
                 print(f"STOP: threshold violated (rmse >= {args.rmse_threshold})")
                 break
+
+            if math.isnan(m.rmse):
+                consecutive_nan += 1
+                if consecutive_nan >= 3:
+                    print("STOP: 3 consecutive NaN RMSE — moving to next combo")
+                    break
+            else:
+                consecutive_nan = 0
 
             if args.quantized_server_cmd is None:
                 break
