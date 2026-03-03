@@ -307,7 +307,6 @@ def run_quantization_eval_matvec(
         },
         "action_rmse": action_rmse,
         "violates_rmse": violates_rmse,
-        "violates_deg": violates_deg,
         "component_rmse": component_rmse,
         "n_observations": len(observations),
         "inference_time_s": elapsed,
