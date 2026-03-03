@@ -264,6 +264,13 @@ python pi0_inout/run_matvec_ulp_sweep.py \
 # Resume an interrupted run:
 python pi0_inout/run_matvec_ulp_sweep.py \
     --checkpoint-dir /path/to/ckpt --resume --output-dir ./matvec_ulp_sweep
+
+# Run only specific combos (e.g. to find threshold crossing for out=fp16 combos):
+python pi0_inout/run_matvec_ulp_sweep.py \
+    --checkpoint-dir /path/to/ckpt \
+    --only-combos e5m2:fp16,fp16:fp16,bf16:fp16 \
+    --max-ulp-n 10000 --ulp-step 50 \
+    --output-dir ./matvec_ulp_sweep
 ```
 
 ### Options
@@ -284,6 +291,7 @@ python pi0_inout/run_matvec_ulp_sweep.py \
 | `--rmse-threshold` | `0.4` | Max rmse threshold default = 0.4 |
 | `--ready-timeout` | `120.0` | Seconds to wait for each server to become ready |
 | `--resume` | off | Skip combos whose `results.json` already exists |
+| `--only-combos` | *(all 16)* | Comma-separated `INPUT:OUTPUT` pairs to run; others are skipped. Accepts short names (`e4m3`, `e5m2`, `fp16`, `bf16`) or full names. Example: `e5m2:fp16,fp16:fp16,bf16:fp16` |
 | `--openpi-dir` | `./openpi` | Override path to openpi repo root |
 
 ---

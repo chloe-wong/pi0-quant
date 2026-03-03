@@ -65,8 +65,11 @@ _SHORT = {
 # Combo generation
 # ---------------------------------------------------------------------------
 
-def format_combos() -> list[tuple[str, str]]:
-    return [(inf, outf) for inf in SWEEP_FORMATS for outf in SWEEP_FORMATS]
+def format_combos(only: list[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
+    all_combos = [(inf, outf) for inf in SWEEP_FORMATS for outf in SWEEP_FORMATS]
+    if only:
+        return [c for c in all_combos if c in only]
+    return all_combos
 
 
 def combo_label(input_fmt: str, output_fmt: str) -> str:
@@ -529,7 +532,7 @@ def main() -> None:
     run_log_path = run_dir / "run.log"
     run_log_fh = run_log_path.open("a", encoding="utf-8")
 
-    combos = format_combos()
+    combos = format_combos(only=args.only_combos)
     logger.info("Sweep: %d format combinations", len(combos))
     run_log_fh.write(f"# run_dir={run_dir}\n")
     run_log_fh.write(f"# combos={len(combos)}  n_obs={args.n_obs}  seed={args.seed}\n")
@@ -686,7 +689,32 @@ def _parse_args() -> argparse.Namespace:
                    help="Path to openpi repo root (passed to serve_quant.py). Default: repo/openpi")
     p.add_argument("--use-fixed-pi0-noise", action="store_true",
                    help="Use deterministic pi0_noise for reproducible comparisons (default: False)")
-    return p.parse_args()
+    p.add_argument("--only-combos", default=None,
+                   help=(
+                       "Comma-separated list of INPUT:OUTPUT pairs to run (others skipped). "
+                       "Accepts short names (e4m3, e5m2, fp16, bf16) or full names. "
+                       "Example: --only-combos e5m2:fp16,fp16:fp16,bf16:fp16"
+                   ))
+    ns = p.parse_args()
+    # Resolve --only-combos to (full_name, full_name) tuples
+    _SHORT_TO_FULL = {v: k for k, v in _SHORT.items()}
+    _SHORT_TO_FULL.update({k: k for k in _SHORT})  # also accept full names
+    if ns.only_combos:
+        resolved = []
+        for token in ns.only_combos.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if ":" not in token:
+                p.error(f"--only-combos: expected INPUT:OUTPUT, got {token!r}")
+            inf_s, outf_s = token.split(":", 1)
+            inf = _SHORT_TO_FULL.get(inf_s.strip())
+            outf = _SHORT_TO_FULL.get(outf_s.strip())
+            if inf is None or outf is None:
+                p.error(f"--only-combos: unknown format in {token!r}. Valid: {list(_SHORT_TO_FULL)}")
+            resolved.append((inf, outf))
+        ns.only_combos = resolved
+    return ns
 
 
 if __name__ == "__main__":
