@@ -83,7 +83,7 @@ from pi0_inout.model_patcher import (
 )
 from pi0_inout.quant_linear import QuantLinear
 from pi0_inout.stats_tracker import StatsTracker
-from pi0_inout.ulp_noise import UlpNoiseConfig
+from pi0_inout.ulp_noise import UlpNoiseConfig, ulp_step
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +647,8 @@ def main() -> None:
             n_ulp=args.ulp_n,
             ulp_fmt=QuantFormat(ulp_fmt_val),
         )
-        logger.info(f"ULP noise: input_fmt={input_fmt.value}  output_fmt={output_fmt.value}  ulp_n={args.ulp_n}  ulp_fmt={ulp_fmt_val}")
+        _ulp_at_1 = float(ulp_step(torch.tensor(1.0), QuantFormat(ulp_fmt_val)).item())
+        logger.info(f"ULP noise: input_fmt={input_fmt.value}  output_fmt={output_fmt.value}  ulp_n={args.ulp_n}  ulp_fmt={ulp_fmt_val}  ulp_at={_ulp_at_1:.4e}")
 
     tracker = StatsTracker()
     patch_model(
