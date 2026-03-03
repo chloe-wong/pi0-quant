@@ -639,6 +639,16 @@ def main() -> None:
 
     active_groups = {QuantGroup(g) for g in args.quantize_components}
 
+    # ULP noise injection into Linear matmul outputs
+    ulp_noise = None
+    if args.ulp_n and args.ulp_n > 0:
+        ulp_fmt_val = args.ulp_fmt if args.ulp_fmt is not None else args.output_fmt
+        ulp_noise = UlpNoiseConfig(
+            n_ulp=args.ulp_n,
+            ulp_fmt=QuantFormat(ulp_fmt_val),
+        )
+        logger.info(f"ULP noise: input_fmt={input_fmt.value}  output_fmt={output_fmt.value}  ulp_n={args.ulp_n}  ulp_fmt={ulp_fmt_val}")
+
     tracker = StatsTracker()
     patch_model(
         model=model,
@@ -646,6 +656,7 @@ def main() -> None:
         output_fmt=output_fmt,
         tracker=tracker,
         active_groups=active_groups,
+        ulp_noise=ulp_noise,
         verbose=False,
     )
     attn_handles = patch_attn_sdpa(
@@ -757,27 +768,26 @@ def parse_args() -> argparse.Namespace:
                    choices=[f.value for f in QuantFormat])
     p.add_argument("--output-fmt", default="bfloat16",
                    choices=[f.value for f in QuantFormat])
-    p.add_argument("--fp8-mode", default="scaled",
-                   choices=["scaled", "clamped", "mx"],
-                   help="FP8 quantization mode: "
-                        "'scaled' = per-tensor absmax (default), "
-                        "'clamped' = clamp to range + flush subnormals, "
-                        "'mx' = MX-compliant power-of-two block scaling")
-    p.add_argument(
-        "--quantize-components",
-        nargs="+",
-        default=[g.value for g in ALL_GROUPS],
-        choices=[g.value for g in ALL_GROUPS],
-        metavar="COMPONENT",
-        help=(
-            "Which model components to quantize (default: all three). "
-            "Choices: vision  transformer  action_head. "
-            "  vision      — SigLIP ViT encoder "
-            "  transformer — PaliGemma LM + action expert (co-attention coupled) "
-            "  action_head — action/state/time projection MLPs "
-            "Example: --quantize-components transformer action_head"
-        ),
-    )
+
+    # Optional: matrix/vector separate formats (constraint: vec_in == mat_out)
+    p.add_argument("--use-matvec", action="store_true",
+                   help="Use matrix/vector IO formats for nn.Linear instead of simple input/output formats")
+    p.add_argument("--mat-in-fmt", default="bfloat16",
+                   choices=[f.value for f in QuantFormat],
+                   help="Matrix input format (activation+weight)")
+    p.add_argument("--mat-out-fmt", default="bfloat16",
+                   choices=[f.value for f in QuantFormat],
+                   help="Matrix output format (matmul output before bias add)")
+    p.add_argument("--vec-out-fmt", default="bfloat16",
+                   choices=[f.value for f in QuantFormat],
+                   help="Vector output format (final output after bias add)")
+
+    # Optional: ULP noise injection into matmul outputs
+    p.add_argument("--ulp-n", type=int, default=0,
+                   help="Inject +/- n ULP noise into each Linear matmul output (0 disables)")
+    p.add_argument("--ulp-fmt", default=None,
+                   choices=[f.value for f in QuantFormat],
+                   help="Format whose ULP grid defines the step size (default: same as --output-fmt)")
 
     # Output
     p.add_argument("--stats-output", default=None,

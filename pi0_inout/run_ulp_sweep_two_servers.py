@@ -31,10 +31,12 @@ from typing import IO, Any, Optional
 import numpy as np
 import torch
 
-# Allow running as a script: ensure repo root is on sys.path.
+# Allow running as a script: ensure repo root and openpi-client src are on sys.path.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_OPENPI_CLIENT_SRC = _REPO_ROOT / "openpi" / "packages" / "openpi-client" / "src"
+for _p in [str(_REPO_ROOT), str(_OPENPI_CLIENT_SRC)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from openpi_client import websocket_client_policy as _ws
 

@@ -222,9 +222,9 @@ The sweep performs simple string replacement on these placeholders before launch
 - `{ulp_fmt}`
 - `{mat_in_fmt}`, `{mat_out_fmt}`, `{vec_out_fmt}`
 
-## MatVec ULP sweep (`run_matvec_ulp_sweep.py`)
+## Automate ULP sweep (`automate_ulp_sweepp.py`)
 
-`run_matvec_ulp_sweep.py` automates iterations of run_ulp_sweep_two_servers.py.
+`automate_ulp_sweepp.py` automates iterations of different combinations of input / output format of run_ulp_sweep_two_servers.py.
 
 **What it does:**
 
@@ -242,35 +242,31 @@ The sweep performs simple string replacement on these placeholders before launch
    - `ulp_rmse_grid.png` — 4×4 grid of RMSE-vs-ulp_n curves
    - `tolerance_hmap.png` — heatmap of max tolerable `ulp_n` per combo
 
-> **Note:** This script currently uses the simple `QuantLinear` mode
-> (`--input-fmt` / `--output-fmt`). `QuantLinearMatVec` (`--use-matvec`) is not
-> used, so vector outputs are **not** yet separately quantized.
-
 ### Usage
 
 ```bash
 # Standard run (base on GPU 0, quantized on GPU 1):
-python pi0_inout/run_matvec_ulp_sweep.py \
+python pi0_inout/automate_ulp_sweepp.py \
     --checkpoint-dir /path/to/safetensors_checkpoint \
-    --output-dir ./matvec_ulp_sweep \
+    --output-dir ./automate_ulp_sweep \
     --gpu-base 0 --gpu-quant 1 \
     --ulp-step 10 --max-ulp-n 1000 # 10 iterations per combo
 
 # Quick smoke test (3 ULP levels, 4 observations per combo):
-python pi0_inout/run_matvec_ulp_sweep.py \
+python pi0_inout/automate_ulp_sweepp.py \
     --checkpoint-dir /path/to/ckpt \
     --max-ulp-n 3 --n-obs 4 --output-dir /tmp/test_sweep
 
 # Resume an interrupted run:
-python pi0_inout/run_matvec_ulp_sweep.py \
-    --checkpoint-dir /path/to/ckpt --resume --output-dir ./matvec_ulp_sweep
+python pi0_inout/automate_ulp_sweepp.py \
+    --checkpoint-dir /path/to/ckpt --resume --output-dir ./automate_ulp_sweep
 
 # Run only specific combos (e.g. to find threshold crossing for out=fp16 combos):
-python pi0_inout/run_matvec_ulp_sweep.py \
+python pi0_inout/automate_ulp_sweepp.py \
     --checkpoint-dir /path/to/ckpt \
     --only-combos e5m2:fp16,fp16:fp16,bf16:fp16 \
     --max-ulp-n 10000 --ulp-step 50 \
-    --output-dir ./matvec_ulp_sweep
+    --output-dir ./automate_ulp_sweep
 ```
 
 ### Options
@@ -279,7 +275,7 @@ python pi0_inout/run_matvec_ulp_sweep.py \
 |---|---|---|
 | `--checkpoint-dir` | *(required)* | Directory containing `model.safetensors` |
 | `--config` | `pi05_droid_jointpos_polaris` | openpi training config name |
-| `--output-dir` | `matvec_ulp_sweep` | Where run directories and plots are written |
+| `--output-dir` | `automate_ulp_sweep` | Where run directories and plots are written |
 | `--gpu-base` | `0` | CUDA device for the base (reference) server |
 | `--gpu-quant` | `1` | CUDA device for the quantized server |
 | `--base-port` | `8000` | WebSocket port for the base server |
@@ -362,12 +358,12 @@ continue an interrupted run.
 ```
 pi0_inout/
 ├── quant_types.py              # QuantFormat enum, quant(), sweep_pairs()
-├── quant_linear.py             # QuantLinear / QuantLinearMatVec: drop-in nn.Linear replacements
+├── quant_linear.py             # QuantLinear drop-in nn.Linear replacements
 ├── model_patcher.py            # patch_model(), unpatch_model(), QuantAttnContext
 ├── stats_tracker.py            # StatsTracker: per-layer Welford RMSE accumulator
 ├── eval_harness.py             # run_quantization_eval(), run_sweep() (no WebSocket needed)
 ├── serve_quant.py              # WebSocket server with quantized Pi0Pytorch
-├── run_matvec_ulp_sweep.py     # Top-level orchestrator: sweeps 16 format combos × ULP levels
+├── automate_ulp_sweepp.py     # Top-level orchestrator: sweeps 16 format combos × ULP levels
 ├── run_ulp_sweep_two_servers.py # Mid-level sweep: sweeps ulp_n on a live quantized server
 ├── run_ulp_server_experiment.py # One-shot RMSE comparison between two already-running servers
 ├── run_benchmark.py            # Full sweep orchestrator (spawns server + sim-evals)

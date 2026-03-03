@@ -1,5 +1,5 @@
 """
-run_matvec_ulp_sweep.py
+automate_ulp_sweep.py
 -----------------------
 Sweep all 16 matrix input/output format combinations ({E4M3, E5M2, FP16, BF16}^2)
 with increasing ULP noise injection, recording end-to-end action RMSE vs. ulp_n.
@@ -13,18 +13,18 @@ For each (input_fmt, output_fmt) pair:
 
 Usage
 -----
-    python pi0_inout/run_matvec_ulp_sweep.py \\
+    python pi0_inout/automate_ulp_sweepp.py \\
         --checkpoint-dir /path/to/model.safetensors_dir \\
-        --output-dir ./matvec_ulp_sweep
+        --output-dir ./automate_ulp_sweep
 
     # Quick smoke test (3 steps, 4 observations per combo):
-    python pi0_inout/run_matvec_ulp_sweep.py \\
+    python pi0_inout/automate_ulp_sweepp.py \\
         --checkpoint-dir /path/to/ckpt \\
         --max-ulp-n 3 --n-obs 4 --output-dir /tmp/test_sweep
 
     # Resume an interrupted run:
-    python pi0_inout/run_matvec_ulp_sweep.py \\
-        --checkpoint-dir /path/to/ckpt --resume --output-dir ./matvec_ulp_sweep
+    python pi0_inout/automate_ulp_sweepp.py \\
+        --checkpoint-dir /path/to/ckpt --resume --output-dir ./automate_ulp_sweep
 """
 
 from __future__ import annotations
@@ -289,6 +289,7 @@ def _run_combo_sweep(
         python, str(sweep_script),
         "--base-port",          str(base_port),
         "--quantized-port",     str(quantized_port),
+        "--ulp-fmt",            output_fmt,
         "--n-obs",              str(n_obs),
         "--seed",               str(seed),
         "--start-ulp-n",        "0",
@@ -680,7 +681,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--rmse-threshold", type=float, default=0.4)
     p.add_argument("--ready-timeout",  type=float, default=120.0,
                    help="Seconds to wait for a server to become ready")
-    p.add_argument("--output-dir", default="matvec_ulp_sweep")
+    p.add_argument("--output-dir", default="automate_ulp_sweep")
     p.add_argument("--resume", action="store_true",
                    help="Skip combos that already have results.json with data")
     p.add_argument("--python", default=None,
