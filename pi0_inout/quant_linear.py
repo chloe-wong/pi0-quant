@@ -86,9 +86,8 @@ class QuantLinear(nn.Module):
         w_q = quant(w_f32, self.input_fmt)   # weight
         b_q = quant(b_f32, self.input_fmt) if b_f32 is not None else None  # bias
 
-        # ── Accumulate in float32: matmul + bias add ──────────────────────────
-        # Split matmul and bias-add so we can optionally inject ULP noise into
-        # the matmul output specifically (as requested by the sweep).
+        # ── Accumulate in float32: F.linear + bias add ──────────────────────────
+        # Split F.linear and bias-add so we can optionally inject ULP noise into the output specifically.
         y_mm = F.linear(x_q, w_q, None)
         if self.ulp_noise is not None and self.ulp_noise.enabled():
             y_mm = inject_ulp_noise(

@@ -59,10 +59,11 @@ def _with_fixed_pi0_noise(
     obs: dict,
     *,
     rng: np.random.Generator,
-    action_shape: tuple[int, ...],
+    action_horizon: int,
+    action_dim: int,
 ) -> dict:
     out = dict(obs)
-    out["pi0_noise"] = rng.standard_normal(action_shape).astype(np.float32)
+    out["pi0_noise"] = rng.standard_normal((action_horizon, action_dim)).astype(np.float32)
     return out
 
 
@@ -380,20 +381,14 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     run_log = (run_dir / "run.log").open("w", encoding="utf-8")
 
-    # Warmup reference and get action shape for optional deterministic pi0_noise.
+    # Warmup reference server.
     obs0 = _random_observation_droid(rng)
     _wait_until_ready(base, obs0, timeout_s=args.ready_timeout_s)
     warm = base.infer(obs0)
-    action_shape = tuple(np.asarray(warm["actions"]).shape)
+    action_horizon = np.asarray(warm["actions"]).shape[0]
+    action_dim = int(base_q.get("action_dim", 32))
 
     use_fixed_pi0_noise = args.use_fixed_pi0_noise
-    if use_fixed_pi0_noise and (len(action_shape) != 2 or action_shape[-1] != 32):
-        logger.warning(
-            "Base server returned unexpected action_shape=%s (expected (H, 32)); "
-            "disabling use_fixed_pi0_noise to avoid shape mismatch",
-            action_shape,
-        )
-        use_fixed_pi0_noise = False
 
     run_log.write(f"# run_dir={run_dir}\n")
     run_log.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
@@ -410,7 +405,7 @@ def main() -> None:
     for _ in range(args.n_obs):
         obs = _random_observation_droid(rng)
         if use_fixed_pi0_noise:
-            obs = _with_fixed_pi0_noise(obs, rng=rng, action_shape=action_shape)
+            obs = _with_fixed_pi0_noise(obs, rng=rng, action_horizon=action_horizon, action_dim=action_dim)
         observations.append(obs)
 
     quantized_proc: Optional[subprocess.Popen] = None

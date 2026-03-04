@@ -170,6 +170,95 @@ python pi0_inout/serve_quant.py \
     --gpu 0
 ```
 
+## Full benchmark sweep
+
+`run_benchmark.py` orchestrates a sweep of all 25 format pairs, spawning
+a `serve_quant.py` server and running `sim-evals/run_eval.py` for each
+combination. Results (RMSE stats + success rate + videos) are written to
+`--output-dir`.
+
+```bash
+python pi0_inout/run_benchmark.py \
+    --sim-evals-dir /path/to/sim-evals \
+    --openpi-dir /path/to/openpi \
+    --checkpoint-dir /path/to/safetensors_checkpoint \
+    --config pi05_droid_jointpos_polaris \
+    --episodes 5 --scenes 1 2 3 \
+    --output-dir ./results
+```
+
+Run `python pi0_inout/run_benchmark.py --help` for all options, including
+`--input-fmts` / `--output-fmts` to restrict the sweep and `--resume` to
+continue an interrupted run.
+
+
+## Automate ULP sweep (`automate_ulp_sweep.py`)
+
+`automate_ulp_sweep.py` automates iterations of different combinations of input / output format of run_ulp_sweep_two_servers.py.
+
+**What it does:**
+
+1. Starts a single **base server** (`serve_quant.py`, bfloat16, no noise) on `--gpu-base`
+   and keeps it alive for the entire run.
+2. Iterates over all **16 format combinations** `(input_fmt × output_fmt)` drawn
+   from `{float8_e4m3, float8_e5m2, float16, bfloat16}`.
+3. For each combo it calls `run_ulp_sweep_two_servers.py` as a subprocess.
+   That script restarts the quantized server (`serve_quant.py`) on `--gpu-quant`
+   for each `ulp_n` step, queries both servers with the same random DROID observations,
+   and stops when `RMSE >= --rmse-threshold` and `nan repeated three times`.
+4. Collects results and writes:
+   - per-combo `results.json` and the inner server logs
+   - `summary.csv` — one row per combo with `max_tol_ulp_n`
+   - `ulp_rmse_grid.png` — 4×4 grid of RMSE-vs-ulp_n curves
+   - `tolerance_hmap.png` — heatmap of max tolerable `ulp_n` per combo
+
+### Usage
+
+```bash
+# Standard run w/ pi0_droid config, base on GPU 1, quantized on GPU 2:
+uv run pi0_inout/automate_ulp_sweep.py \
+    --checkpoint-dir /path/to/pi0_droid_jointpos_safetensors \
+    --config pi0_droid \
+    --base-port 8001 --gpu-base 1 \
+    --gpu-quant 2 --quantized-port 8002 \
+    --max-ulp-n 1000 --ulp-step 10 \
+    --output-dir automate_ulp_sweep
+
+# Run only specific combos
+python pi0_inout/automate_ulp_sweep.py \
+    --checkpoint-dir /path/to/pi0_droid_jointpos_safetensors \
+    --only-combos e5m2:fp16,fp16:fp16,bf16:fp16 \
+    --config pi0_droid \
+    --base-port 8001 --gpu-base 1 \
+    --gpu-quant 2 --quantized-port 8002 \
+    --max-ulp-n 1000 --ulp-step 10 \
+    --output-dir automate_ulp_sweep
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--checkpoint-dir` | *(required)* | Directory containing `model.safetensors` |
+| `--config` | `pi05_droid_jointpos_polaris` | openpi training config name |
+| `--output-dir` | `automate_ulp_sweep` | Where run directories and plots are written |
+| `--gpu-base` | `0` | CUDA device for the base (reference) server |
+| `--gpu-quant` | `1` | CUDA device for the quantized server |
+| `--base-port` | `8000` | WebSocket port for the base server |
+| `--quantized-port` | `8002` | WebSocket port for the quantized server |
+| `--max-ulp-n` | `5000` | Maximum `ulp_n` to sweep up to |
+| `--ulp-step` | `1` | Increment per sweep step (e.g. `10` → 10, 20, 30 …) |
+| `--n-obs` | `16` | Random DROID observations per combo |
+| `--seed` | `0` | RNG seed |
+| `--rmse-threshold` | `0.4` | Max rmse threshold default = 0.4 |
+| `--ready-timeout` | `120.0` | Seconds to wait for each server to become ready |
+| `--resume` | off | Skip combos whose `results.json` already exists |
+| `--only-combos` | *(all 16)* | Comma-separated `INPUT:OUTPUT` pairs to run; others are skipped. Accepts short names (`e4m3`, `e5m2`, `fp16`, `bf16`) or full names. Example: `e5m2:fp16,fp16:fp16,bf16:fp16` |
+| `--openpi-dir` | `./openpi` | Override path to openpi repo root |
+| `--no-fixed-pi0-noise` | off | Disable deterministic `obs["pi0_noise"]` injection (random diffusion noise per run) |
+
+---
+
 ## ULP sweep (two servers)
 
 `run_ulp_sweep_two_servers.py` compares a **base server** vs a **quantized server** over the same randomly generated observations, and sweeps `--ulp-n` on the quantized side. Base server and quantized server must be run on **different CUDA_VISIBLE_DEVICES** as each server is quite heavy to run.
@@ -195,7 +284,7 @@ If you omit `--quantized-server-cmd`, the script will **evaluate whatever is alr
   - `--base-host` (default `127.0.0.1`)
   - `--base-port` (default `8000`)
   - `--quantized-host` (default `127.0.0.1`)
-  - `--quantized-port` (default `8001`)
+  - `--quantized-port` (default `8002`)
 - **sweep controls**
   - `--start-ulp-n` (default `1`)
   - `--ulp-step` (default `1`)
@@ -222,76 +311,6 @@ The sweep performs simple string replacement on these placeholders before launch
 - `{ulp_fmt}`
 - `{mat_in_fmt}`, `{mat_out_fmt}`, `{vec_out_fmt}`
 
-## Automate ULP sweep (`automate_ulp_sweepp.py`)
-
-`automate_ulp_sweepp.py` automates iterations of different combinations of input / output format of run_ulp_sweep_two_servers.py.
-
-**What it does:**
-
-1. Starts a single **base server** (`serve_quant.py`, bfloat16, no noise) on `--gpu-base`
-   and keeps it alive for the entire run.
-2. Iterates over all **16 format combinations** `(input_fmt × output_fmt)` drawn
-   from `{float8_e4m3, float8_e5m2, float16, bfloat16}`.
-3. For each combo it calls `run_ulp_sweep_two_servers.py` as a subprocess.
-   That script restarts the quantized server (`serve_quant.py`) on `--gpu-quant`
-   for each `ulp_n` step, queries both servers with the same random DROID observations,
-   and stops when `RMSE >= --rmse-threshold` and `nan repeated three times`.
-4. Collects results and writes:
-   - per-combo `results.json` and the inner server logs
-   - `summary.csv` — one row per combo with `max_tol_ulp_n`
-   - `ulp_rmse_grid.png` — 4×4 grid of RMSE-vs-ulp_n curves
-   - `tolerance_hmap.png` — heatmap of max tolerable `ulp_n` per combo
-
-### Usage
-
-```bash
-# Standard run (base on GPU 0, quantized on GPU 1):
-python pi0_inout/automate_ulp_sweepp.py \
-    --checkpoint-dir /path/to/safetensors_checkpoint \
-    --output-dir ./automate_ulp_sweep \
-    --gpu-base 0 --gpu-quant 1 \
-    --ulp-step 10 --max-ulp-n 1000 # 10 iterations per combo
-
-# Quick smoke test (3 ULP levels, 4 observations per combo):
-python pi0_inout/automate_ulp_sweepp.py \
-    --checkpoint-dir /path/to/ckpt \
-    --max-ulp-n 3 --n-obs 4 --output-dir /tmp/test_sweep
-
-# Resume an interrupted run:
-python pi0_inout/automate_ulp_sweepp.py \
-    --checkpoint-dir /path/to/ckpt --resume --output-dir ./automate_ulp_sweep
-
-# Run only specific combos (e.g. to find threshold crossing for out=fp16 combos):
-python pi0_inout/automate_ulp_sweepp.py \
-    --checkpoint-dir /path/to/ckpt \
-    --only-combos e5m2:fp16,fp16:fp16,bf16:fp16 \
-    --max-ulp-n 10000 --ulp-step 50 \
-    --output-dir ./automate_ulp_sweep
-```
-
-### Options
-
-| Flag | Default | Description |
-|---|---|---|
-| `--checkpoint-dir` | *(required)* | Directory containing `model.safetensors` |
-| `--config` | `pi05_droid_jointpos_polaris` | openpi training config name |
-| `--output-dir` | `automate_ulp_sweep` | Where run directories and plots are written |
-| `--gpu-base` | `0` | CUDA device for the base (reference) server |
-| `--gpu-quant` | `1` | CUDA device for the quantized server |
-| `--base-port` | `8000` | WebSocket port for the base server |
-| `--quantized-port` | `8002` | WebSocket port for the quantized server |
-| `--max-ulp-n` | `5000` | Maximum `ulp_n` to sweep up to |
-| `--ulp-step` | `1` | Increment per sweep step (e.g. `10` → 10, 20, 30 …) |
-| `--n-obs` | `16` | Random DROID observations per combo |
-| `--seed` | `0` | RNG seed |
-| `--rmse-threshold` | `0.4` | Max rmse threshold default = 0.4 |
-| `--ready-timeout` | `120.0` | Seconds to wait for each server to become ready |
-| `--resume` | off | Skip combos whose `results.json` already exists |
-| `--only-combos` | *(all 16)* | Comma-separated `INPUT:OUTPUT` pairs to run; others are skipped. Accepts short names (`e4m3`, `e5m2`, `fp16`, `bf16`) or full names. Example: `e5m2:fp16,fp16:fp16,bf16:fp16` |
-| `--openpi-dir` | `./openpi` | Override path to openpi repo root |
-
----
-
 ## One-shot server comparison (`run_ulp_server_experiment.py`)
 
 `run_ulp_server_experiment.py` is a **standalone** manual tool for a single
@@ -315,7 +334,7 @@ python pi0_inout/run_ulp_server_experiment.py \
     --base-port 8000 \
     --quantized-port 8001 \
     --n-obs 8 \
-    --quantized-ulp-n 10 --quantized-ulp-fmt bfloat16
+    --ulp-n 10 --ulp-fmt bfloat16
 ```
 
 ### Options
@@ -326,32 +345,11 @@ python pi0_inout/run_ulp_server_experiment.py \
 | `--quantized-port` | `8001` | WebSocket port of the quantized server |
 | `--n-obs` | `8` | Number of random observations to compare |
 | `--seed` | `0` | RNG seed |
-| `--quantized-ulp-n` | `None` | Label only — printed in the output line |
-| `--quantized-ulp-fmt` | `None` | Label only — printed in the output line |
+| `--ulp-n` | `None` | Label only — printed in the output line (aliases: `--quantized-ulp-n`, `--noisy-ulp-n`) |
+| `--ulp-fmt` | `None` | Label only — printed in the output line (aliases: `--quantized-ulp-fmt`, `--noisy-ulp-fmt`) |
 | `--rmse-threshold` | `0.4` | Print `THRESHOLD VIOLATED` if RMSE exceeds this |
 
 ---
-
-## Full benchmark sweep
-
-`run_benchmark.py` orchestrates a sweep of all 25 format pairs, spawning
-a `serve_quant.py` server and running `sim-evals/run_eval.py` for each
-combination. Results (RMSE stats + success rate + videos) are written to
-`--output-dir`.
-
-```bash
-python pi0_inout/run_benchmark.py \
-    --sim-evals-dir /path/to/sim-evals \
-    --openpi-dir /path/to/openpi \
-    --checkpoint-dir /path/to/safetensors_checkpoint \
-    --config pi05_droid_jointpos_polaris \
-    --episodes 5 --scenes 1 2 3 \
-    --output-dir ./results
-```
-
-Run `python pi0_inout/run_benchmark.py --help` for all options, including
-`--input-fmts` / `--output-fmts` to restrict the sweep and `--resume` to
-continue an interrupted run.
 
 ## Package layout
 
@@ -363,8 +361,8 @@ pi0_inout/
 ├── stats_tracker.py            # StatsTracker: per-layer Welford RMSE accumulator
 ├── eval_harness.py             # run_quantization_eval(), run_sweep() (no WebSocket needed)
 ├── serve_quant.py              # WebSocket server with quantized Pi0Pytorch
-├── automate_ulp_sweepp.py     # Top-level orchestrator: sweeps 16 format combos × ULP levels
-├── run_ulp_sweep_two_servers.py # Mid-level sweep: sweeps ulp_n on a live quantized server
+├── automate_ulp_sweep.py     # Top-level orchestrator: sweeps 16 format combos × ULP levels
+├── run_ulp_sweep_two_servers.py # RMSE sweeps between base and varying ulp on quantized server
 ├── run_ulp_server_experiment.py # One-shot RMSE comparison between two already-running servers
 ├── run_benchmark.py            # Full sweep orchestrator (spawns server + sim-evals)
 └── _jax_stubs.py               # Stub modules so Pi0Pytorch loads without JAX

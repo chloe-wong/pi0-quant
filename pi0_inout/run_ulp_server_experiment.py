@@ -82,30 +82,23 @@ def main() -> None:
     p.add_argument("--base-ulp-fmt", "--exact-ulp-fmt", default=None)
     p.add_argument("--quantized-input-fmt", "--noisy-input-fmt", default=None)
     p.add_argument("--quantized-output-fmt", "--noisy-output-fmt", default=None)
-    p.add_argument("--quantized-ulp-n", "--noisy-ulp-n", type=int, default=None)
-    p.add_argument("--quantized-ulp-fmt", "--noisy-ulp-fmt", default=None)
-
-    # Backwards-compatible aliases (map to the *noisy* server label).
-    p.add_argument("--ulp-n", type=int, default=None)
-    p.add_argument("--ulp-fmt", default=None)
+    p.add_argument("--ulp-n", "--noisy-ulp-n", "--quantized-ulp-n", type=int, default=None)
+    p.add_argument("--ulp-fmt", "--noisy-ulp-fmt", "--quantized-ulp-fmt", default=None)
     p.add_argument("--rmse-threshold", type=float, default=0.4)
     args = p.parse_args()
-
-    if args.quantized_ulp_n is None and args.ulp_n is not None:
-        args.quantized_ulp_n = args.ulp_n
-    if args.quantized_ulp_fmt is None and args.ulp_fmt is not None:
-        args.quantized_ulp_fmt = args.ulp_fmt
 
     rng = np.random.default_rng(args.seed)
 
     base = _ws.WebsocketClientPolicy(host=args.base_host, port=args.base_port)
     quantized = _ws.WebsocketClientPolicy(host=args.quantized_host, port=args.quantized_port)
 
-    # Model load + determine action shape.
+    # Model load + determine action shape from server metadata.
     obs0 = _random_observation_droid(rng)
     warm = base.infer(obs0)
     quantized.infer(obs0)
-    action_shape = np.asarray(warm["actions"]).shape
+    action_horizon = np.asarray(warm["actions"]).shape[0]
+    base_md = base.get_server_metadata() or {}
+    action_dim = int(base_md.get("action_dim", 32))
 
     base_actions = []
     quantized_actions = []
@@ -113,7 +106,7 @@ def main() -> None:
     for _ in range(args.n_obs):
         obs = _random_observation_droid(rng)
         # Deterministic diffusion noise so identical servers match.
-        obs["pi0_noise"] = rng.standard_normal(action_shape).astype(np.float32)
+        obs["pi0_noise"] = rng.standard_normal((action_horizon, action_dim)).astype(np.float32)
 
         b = _to_actions_tensor(base.infer(obs))
         q = _to_actions_tensor(quantized.infer(obs))
@@ -126,7 +119,7 @@ def main() -> None:
     )
     quantized_label = (
         f"in={args.quantized_input_fmt} out={args.quantized_output_fmt} "
-        f"ulp_n={args.quantized_ulp_n} ulp_fmt={args.quantized_ulp_fmt}"
+        f"ulp_n={args.ulp_n} ulp_fmt={args.ulp_fmt}"
     )
     print(
         f"rmse={m.rmse:.4e}  "

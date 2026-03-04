@@ -566,8 +566,15 @@ class Pi0PyTorchPolicy:
             token_loss_mask=token_loss_mask,
         )
 
+        # Optional fixed noise for reproducible comparisons (shape: (H, 32) or (1, H, 32)).
+        noise = None
+        if "pi0_noise" in obs:
+            noise = torch.from_numpy(np.asarray(obs["pi0_noise"], dtype=np.float32)).to(dev)
+            if noise.ndim == 2:
+                noise = noise.unsqueeze(0)  # (H, 32) → (1, H, 32)
+
         with torch.no_grad():
-            actions = self.model.sample_actions(str(dev), obs_ns, num_steps=10)
+            actions = self.model.sample_actions(str(dev), obs_ns, noise=noise, num_steps=10)
         # actions: [1, action_horizon, 32]  (normalized action space)
         actions = actions.squeeze(0).cpu().numpy()  # (horizon, 32)
 
@@ -704,6 +711,8 @@ def main() -> None:
         max_token_len=cfg.max_token_len,
         tokenizer_path=args.tokenizer_path,
     )
+    policy.metadata["action_dim"]     = cfg.action_dim
+    policy.metadata["action_horizon"] = cfg.action_horizon
 
     from openpi.serving import websocket_policy_server
     import socket

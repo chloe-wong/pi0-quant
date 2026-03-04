@@ -598,7 +598,7 @@ def main() -> None:
                 config=args.config,
                 gpu_quant=args.gpu_quant,
                 openpi_dir=openpi_dir,
-                use_fixed_pi0_noise=args.use_fixed_pi0_noise,
+                use_fixed_pi0_noise=not args.no_fixed_pi0_noise,
                 log_fh=run_log_fh,
             )
 
@@ -688,8 +688,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Python interpreter for servers (default: sys.executable)")
     p.add_argument("--openpi-dir", default=None,
                    help="Path to openpi repo root (passed to serve_quant.py). Default: repo/openpi")
-    p.add_argument("--use-fixed-pi0-noise", action="store_true",
-                   help="Use deterministic pi0_noise for reproducible comparisons (default: False)")
+    p.add_argument("--no-fixed-pi0-noise", action="store_true",
+                   help="Disable deterministic pi0_noise (random diffusion noise per run)")
     p.add_argument("--only-combos", default=None,
                    help=(
                        "Comma-separated list of INPUT:OUTPUT pairs to run (others skipped). "
