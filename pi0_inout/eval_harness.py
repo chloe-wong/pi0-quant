@@ -276,11 +276,7 @@ def default_sweep_configs(
     Default: 16 combinations of
         {BF16, FP16, FP8-E4M3, FP8-E5M2} × same.
 
-<<<<<<< HEAD
-    BF16 × BF16 is the identity baseline (expected RMSE = 0).
-=======
     BF16 × BF16 is the identity baseline (expected RMSE = 0 for bf16 models).
->>>>>>> dae36ec42a56f9bed5c015090b9982a71be0f353
 
     Args:
         input_formats:  Override the default input format list.
