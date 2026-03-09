@@ -32,13 +32,10 @@ def inject_rel_noise(y: torch.Tensor, *, rel_err: float) -> torch.Tensor:
     """
     if rel_err == 0.0:
         return y
-    if rel_err < 0:
-        raise ValueError("rel_err must be >= 0")
 
-    y_f32 = y.float()
     sign = torch.where(
-        torch.rand_like(y_f32) < 0.5,
-        torch.tensor(-1.0, device=y_f32.device, dtype=y_f32.dtype),
-        torch.tensor(1.0, device=y_f32.device, dtype=y_f32.dtype),
+        torch.rand_like(y) < 0.5,
+        torch.tensor(-1.0, device=y.device, dtype=y.dtype),
+        torch.tensor(1.0, device=y.device, dtype=y.dtype),
     )
-    return (y_f32 + rel_err * y_f32.abs() * sign).to(y.dtype)
+    return y + rel_err * y.abs() * sign
