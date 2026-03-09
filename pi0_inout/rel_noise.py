@@ -32,7 +32,8 @@ def inject_rel_noise(y: torch.Tensor, *, rel_err: float) -> torch.Tensor:
     """
     if rel_err == 0.0:
         return y
-
+    if rel_err < 0:
+        raise ValueError("rel_err must be >= 0")
     sign = torch.where(
         torch.rand_like(y) < 0.5,
         torch.tensor(-1.0, device=y.device, dtype=y.dtype),
