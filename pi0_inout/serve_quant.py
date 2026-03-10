@@ -83,6 +83,7 @@ from pi0_inout.model_patcher import (
 )
 from pi0_inout.quant_linear import QuantLinear
 from pi0_inout.stats_tracker import StatsTracker
+from pi0_inout.rel_noise import RelNoiseConfig, inject_rel_noise
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +155,28 @@ def _get_model_config(config_name: str) -> SimpleNamespace:
         f"Known: {list(_KNOWN_CONFIGS)}"
     )
     return _KNOWN_CONFIGS["pi05_droid_jointpos_polaris"]
+
+
+# ---------------------------------------------------------------------------
+# Relative-error noise injection (post-patching hook on QuantLinear)
+# ---------------------------------------------------------------------------
+
+def _install_rel_noise(model: nn.Module, rel_err: float) -> None:
+    """
+    Monkey-patch every QuantLinear in `model` to inject ±rel_err * |y|
+    noise into each matmul output (after quantization).
+    """
+    if rel_err == 0.0:
+        return
+    for _name, mod in model.named_modules():
+        if isinstance(mod, QuantLinear):
+            orig_forward = mod.forward
+
+            def _noisy_forward(x, _orig=orig_forward, _rel=rel_err):
+                y = _orig(x)
+                return inject_rel_noise(y, rel_err=_rel)
+
+            mod.forward = _noisy_forward
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +454,7 @@ class Pi0PyTorchPolicy:
     ) -> None:
         self.model    = model
         self.device   = device
-        self.metadata = {"model": "PI0Pytorch", "quantized": True}
+        self.metadata = {"model": "PI0Pytorch", "quantized": True, "quant": {}}
         self.norm_stats = norm_stats
         self.use_quantile_norm = use_quantile_norm
         self.is_joint_position = is_joint_position
@@ -569,8 +592,18 @@ class Pi0PyTorchPolicy:
             token_loss_mask=token_loss_mask,
         )
 
+        # ── Deterministic diffusion noise (if client sends pi0_noise) ─────
+        pi0_noise = obs.get("pi0_noise")
+        noise_tensor = None
+        if pi0_noise is not None:
+            noise_tensor = torch.from_numpy(
+                np.asarray(pi0_noise, dtype=np.float32).copy()
+            ).unsqueeze(0).to(dev)  # (1, action_horizon, action_dim)
+
         with torch.no_grad():
-            actions = self.model.sample_actions(str(dev), obs_ns, num_steps=10)
+            actions = self.model.sample_actions(
+                str(dev), obs_ns, noise=noise_tensor, num_steps=10
+            )
         # actions: [1, action_horizon, 32]  (normalized action space)
         actions = actions.squeeze(0).cpu().numpy()  # (horizon, 32)
 
@@ -659,6 +692,11 @@ def main() -> None:
         f"components={args.quantize_components}"
     )
 
+    # ── Inject relative-error noise if requested ──────────────────────────
+    if args.rel_err > 0:
+        _install_rel_noise(model, args.rel_err)
+        logger.info(f"Relative-error noise enabled: rel_err={args.rel_err}")
+
     # ── Print quantization diagnostics ────────────────────────────────────
     print_quant_diagnostics(model, input_fmt, output_fmt)
 
@@ -712,6 +750,14 @@ def main() -> None:
         max_token_len=cfg.max_token_len,
         tokenizer_path=args.tokenizer_path,
     )
+    # Expose quant config in metadata so sweep scripts can read it
+    policy.metadata["quant"] = {
+        "input_fmt": input_fmt.value,
+        "output_fmt": output_fmt.value,
+        "rel_err": args.rel_err,
+        "action_dim": cfg.action_dim,
+        "action_horizon": cfg.action_horizon,
+    }
 
     from openpi.serving import websocket_policy_server
     import socket
@@ -777,6 +823,10 @@ def parse_args() -> argparse.Namespace:
             "Example: --quantize-components transformer action_head"
         ),
     )
+
+    # Relative-error noise injection
+    p.add_argument("--rel-err", type=float, default=0.0,
+                   help="Inject ±rel_err * |y| noise into every QuantLinear output (0 = off)")
 
     # Output
     p.add_argument("--stats-output", default=None,
