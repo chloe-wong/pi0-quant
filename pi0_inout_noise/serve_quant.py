@@ -59,14 +59,14 @@ _THIS_DIR    = Path(__file__).resolve().parent
 _OPENPI_DIR  = Path(os.environ.get("OPENPI_DIR", _THIS_DIR.parent / "openpi"))
 _OPENPI_SRC  = _OPENPI_DIR / "src"
 _CLIENT_SRC  = _OPENPI_DIR / "packages" / "openpi-client" / "src"
-_PI0_INOUT   = _THIS_DIR          # for "from pi0_inout import ..."
+_PI0_INOUT   = _THIS_DIR          
 
 for _p in [str(_PI0_INOUT.parent), str(_CLIENT_SRC), str(_OPENPI_SRC)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 # ── Inject JAX stubs BEFORE any openpi import ────────────────────────────────
-from pi0_inout._jax_stubs import inject as _inject_jax_stubs   # noqa: E402
+from pi0_inout_noise._jax_stubs import inject as _inject_jax_stubs   # noqa: E402
 _inject_jax_stubs()
 
 # ── Now it is safe to import the pytorch model ────────────────────────────────
@@ -74,16 +74,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# ── pi0_inout imports (quantization layer) ────────────────────────────────────
-from pi0_inout.quant_types import QuantFormat, TORCH_DTYPE, FORMAT_BITS, set_fp8_mode
-from pi0_inout.model_patcher import (
+# ── pi0_inout_noise imports (quantization layer) ──────────────────────────────
+from pi0_inout_noise.quant_types import QuantFormat, TORCH_DTYPE, FORMAT_BITS, set_fp8_mode
+from pi0_inout_noise.model_patcher import (
     patch_model, list_linear_layers,
     QuantGroup, ALL_GROUPS,
     patch_attn_sdpa, unpatch_attn_sdpa,
 )
-from pi0_inout.quant_linear import QuantLinear
-from pi0_inout.stats_tracker import StatsTracker
-from pi0_inout.rel_noise import RelNoiseConfig
+from pi0_inout_noise.quant_linear import QuantLinear
+from pi0_inout_noise.stats_tracker import StatsTracker
+from pi0_inout_noise.rel_noise import RelNoiseConfig
 
 
 # ---------------------------------------------------------------------------

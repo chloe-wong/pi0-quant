@@ -13,17 +13,17 @@ For each (input_fmt, output_fmt) pair:
 
 Usage
 -----
-    python pi0_inout/automate_rel_sweepp.py \\
+    python pi0_inout_noise/automate_rel_sweep.py \\
         --checkpoint-dir /path/to/model.safetensors_dir \\
         --output-dir ./automate_rel_sweep
 
     # Quick smoke test (3 steps, 4 observations per combo):
-    python pi0_inout/automate_rel_sweepp.py \\
+    python pi0_inout_noise/automate_rel_sweep.py \\
         --checkpoint-dir /path/to/ckpt \\
         --max-rel-err 3 --n-obs 4 --output-dir /tmp/test_sweep
 
     # Resume an interrupted run:
-    python pi0_inout/automate_rel_sweepp.py \\
+    python pi0_inout_noise/automate_rel_sweep.py \\
         --checkpoint-dir /path/to/ckpt --resume --output-dir ./automate_rel_sweep
 """
 
