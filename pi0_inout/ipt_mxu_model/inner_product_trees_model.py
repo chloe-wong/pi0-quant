@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 
-from fp_formats import E4M3ProdFmt, wrap_signed
+from fp_formats import AddendSel, E4M3ProdFmt, wrap_signed
 from params_and_requests import ComputeReq, WeightLoadReq, StepResult, InnerProductTreeParams
 from converters import (
     e4m3_mul_to_prod,
@@ -21,7 +21,6 @@ class AnchorAccumulationTreeModel:
         self.p = p
         self.sentinel = -(1 << (p.expWorkWidth - 2))
 
-        # Hoist repeated format parameters used in hot paths.
         bias_fmt = p.biasFmt
         psum_fmt = p.psumFmt
 
@@ -29,16 +28,14 @@ class AnchorAccumulationTreeModel:
         self._int_width = p.intWidth
 
         self._bias_mant_bits = bias_fmt.mantissaBits
-        self._bias_exp_width = bias_fmt.expWidth
-        self._bias_bias = bias_fmt.ieeeBias
         self._bias_exp_mask = (1 << bias_fmt.expWidth) - 1
         self._bias_zero_mask = (1 << (bias_fmt.expWidth + 1)) - 1
+        self._bias_bias = bias_fmt.ieeeBias
 
         self._psum_mant_bits = psum_fmt.mantissaBits
-        self._psum_exp_width = psum_fmt.expWidth
-        self._psum_bias = psum_fmt.ieeeBias
         self._psum_exp_mask = (1 << psum_fmt.expWidth) - 1
         self._psum_frac_mask = (1 << psum_fmt.mantissaBits) - 1
+        self._psum_bias = psum_fmt.ieeeBias
 
     def _product_unbiased_exp(self, prod_bits: int) -> int:
         exp_bits = (prod_bits >> 7) & 0x1F
@@ -58,7 +55,6 @@ class AnchorAccumulationTreeModel:
     ) -> int:
         weights = weight_buf1 if buf_read_sel else weight_buf0
 
-        # S0: products and max product exponent in one pass.
         prod_s0 = []
         max_prod_exp = self.sentinel
         for a, w in zip(act, weights):
@@ -70,42 +66,36 @@ class AnchorAccumulationTreeModel:
             if prod_exp > max_prod_exp:
                 max_prod_exp = prod_exp
 
-        # Decode addend exponent only for selected addend path.
-        addend_name = addend_sel.name
         addend_exp = self.sentinel
 
-        if addend_name == "UseBias":
+        if addend_sel is AddendSel.UseBias:
             bias_exp_field = (bias >> self._bias_mant_bits) & self._bias_exp_mask
             bias_is_zero = ((bias >> self._bias_mant_bits) & self._bias_zero_mask) == 0
             if not bias_is_zero:
                 addend_exp = bias_exp_field - self._bias_bias
 
-        elif addend_name == "UsePsum":
+        elif addend_sel is AddendSel.UsePsum:
             psum_exp_field = (psum >> self._psum_mant_bits) & self._psum_exp_mask
             psum_frac = psum & self._psum_frac_mask
             psum_is_zero = (psum_exp_field == 0) and (psum_frac == 0)
             if not psum_is_zero:
                 addend_exp = psum_exp_field - self._psum_bias
 
-        # S1: anchor
         anchor = (max_prod_exp if max_prod_exp >= addend_exp else addend_exp) + self._anchor_headroom
 
-        # S2 + S3: convert, reduce, and add selected addend.
         int_width = self._int_width
         prod_sum = 0
         for prod in prod_s0:
             prod_sum = wrap_signed(prod_sum + e4m3_prod_to_aligned_int(prod, anchor, int_width), int_width)
 
-        if addend_name == "UseBias":
+        if addend_sel is AddendSel.UseBias:
             addend_int = ieee_to_aligned_int(bias, self.p.biasFmt, anchor, int_width)
-        elif addend_name == "UsePsum":
+        elif addend_sel is AddendSel.UsePsum:
             addend_int = ieee_to_aligned_int(psum, self.p.psumFmt, anchor, int_width)
         else:
             addend_int = 0
 
         total_int = wrap_signed(prod_sum + addend_int, int_width)
-
-        # S4 + output conversion
         bf16_result = aligned_int_to_bf16(total_int, anchor, int_width)
         return output_conv_stage(bf16_result, out_fmt_sel, scale_exp)
 
@@ -122,6 +112,13 @@ class InnerProductTreesModel:
     @property
     def buf_read_sel(self) -> bool:
         return not self.wEn
+
+    def reset(self) -> None:
+        p = self.p
+        self.wEn = False
+        self.wbuf0 = [[0] * p.vecLen for _ in range(p.numLanes)]
+        self.wbuf1 = [[0] * p.vecLen for _ in range(p.numLanes)]
+        self.out_queue = deque([None] * p.latency)
 
     def load_weights(self, req: WeightLoadReq) -> None:
         p = self.p
@@ -155,7 +152,6 @@ class InnerProductTreesModel:
         if len(req.scaleExp) != num_lanes:
             raise ValueError(f"scaleExp length must be {num_lanes}")
 
-        # Mask once instead of once per lane.
         act_masked = [x & 0xFF for x in req.act]
 
         buf_read_sel = self.buf_read_sel
@@ -182,6 +178,7 @@ class InnerProductTreesModel:
                 addend_sel=addend_sel,
                 out_fmt_sel=out_fmt_sel,
             ) & 0xFFFF
+
         return out
 
     def step(

@@ -3,30 +3,27 @@ from __future__ import annotations
 import math
 
 from fp_formats import (
-    E4M3,
     BF16,
     E4M3ProdFmt,
     E4M3_MAX_NEG,
     E4M3_MAX_POS,
-    decode_e4m3,
+    OutputFmtSel,
     encode_e4m3_normal,
     f32_to_bf16_bits_rne,
     round_right_shift4_rne,
     sanitize_bf16,
     wrap_signed,
 )
-from params_and_requests import InnerProductTreeParams
 
-
-# Product model: E4M3 x E4M3 -> 13-bit custom float
-# Product format: S(1) E(5, bias=13)
 
 _E4M3_PROD_EXP_WIDTH = E4M3ProdFmt.expWidth
 _E4M3_PROD_BIAS = E4M3ProdFmt.bias
 _E4M3_PROD_SIG_WIDTH = E4M3ProdFmt.sigWidth
 _E4M3_PROD_EXP_MAX = (1 << _E4M3_PROD_EXP_WIDTH) - 1
-
 _BF16_BIAS = BF16.ieeeBias
+
+# Flat LUT indexed by (a << 8) | b
+_E4M3_MUL_TO_PROD_LUT = [0] * 65536
 
 
 def pack_e4m3_prod(sign: int, exp_unb: int, mant7: int) -> int:
@@ -38,35 +35,44 @@ def pack_e4m3_prod(sign: int, exp_unb: int, mant7: int) -> int:
     return ((sign & 1) << 12) | ((exp_field & 0x1F) << 7) | (mant7 & 0x7F)
 
 
+def _build_e4m3_mul_to_prod_lut() -> None:
+    idx = 0
+    for a_bits in range(256):
+        a_sign = (a_bits >> 7) & 1
+        a_exp = (a_bits >> 3) & 0xF
+        a_man = a_bits & 0x7
+
+        a_zero = (a_exp == 0)
+
+        for b_bits in range(256):
+            b_sign = (b_bits >> 7) & 1
+            b_exp = (b_bits >> 3) & 0xF
+            b_man = b_bits & 0x7
+
+            out_sign = a_sign ^ b_sign
+
+            if a_zero or b_exp == 0:
+                _E4M3_MUL_TO_PROD_LUT[idx] = out_sign << 12
+                idx += 1
+                continue
+
+            a_sig = 8 | a_man
+            b_sig = 8 | b_man
+            prod_sig = a_sig * b_sig
+
+            need_shift = (prod_sig >> 7) & 1
+            out_man = (prod_sig & 0x7F) if need_shift else ((prod_sig & 0x3F) << 1)
+            out_exp = a_exp + b_exp + need_shift - 1
+
+            _E4M3_MUL_TO_PROD_LUT[idx] = (out_sign << 12) | ((out_exp & 0x1F) << 7) | out_man
+            idx += 1
+
+
+_build_e4m3_mul_to_prod_lut()
+
+
 def e4m3_mul_to_prod(a_bits: int, b_bits: int) -> int:
-    a_bits &= 0xFF
-    b_bits &= 0xFF
-
-    a_sign = (a_bits >> 7) & 1
-    b_sign = (b_bits >> 7) & 1
-    out_sign = a_sign ^ b_sign
-
-    a_exp = (a_bits >> 3) & 0xF
-    b_exp = (b_bits >> 3) & 0xF
-
-    # Any exp == 0 is treated as zero.
-    if a_exp == 0 or b_exp == 0:
-        return out_sign << 12
-
-    a_sig = 8 | (a_bits & 0x7)   # (1 << 3) | mant
-    b_sig = 8 | (b_bits & 0x7)
-    prod_sig = a_sig * b_sig      # 8-bit product
-
-    need_shift = (prod_sig >> 7) & 1
-    out_man = (prod_sig & 0x7F) if need_shift else ((prod_sig & 0x3F) << 1)
-
-    # biased_out = aExp + bExp - 1 + needShift
-    out_exp = a_exp + b_exp + need_shift - 1
-
-    return (out_sign << 12) | ((out_exp & 0x1F) << 7) | out_man
-
-
-# Format converters
+    return _E4M3_MUL_TO_PROD_LUT[((a_bits & 0xFF) << 8) | (b_bits & 0xFF)]
 
 
 def ieee_to_aligned_int(ieee_bits: int, fmt, anchor_exp: int, int_width: int) -> int:
@@ -83,7 +89,6 @@ def ieee_to_aligned_int(ieee_bits: int, fmt, anchor_exp: int, int_width: int) ->
 
     unb_exp = exp_field - fmt.ieeeBias
     full_sig = ((exp_field != 0) << mant_bits) | frac
-
     shift_right = anchor_exp - unb_exp - (int_width - 1 - mant_bits)
 
     if shift_right >= int_width:
@@ -127,11 +132,7 @@ def aligned_int_to_bf16(int_in: int, anchor_exp: int, int_width: int) -> int:
     int_in = wrap_signed(int_in, int_width)
     if int_in == 0:
         return 0
-
     return f32_to_bf16_bits_rne(math.ldexp(float(int_in), anchor_exp - (int_width - 1)))
-
-
-# Optional output conversion stage
 
 
 def bf16_scale_to_e4m3(bf16_bits: int, scale_exp: int) -> int:
@@ -141,18 +142,15 @@ def bf16_scale_to_e4m3(bf16_bits: int, scale_exp: int) -> int:
     exp_bf16 = (bf16_bits >> 7) & 0xFF
     frac_bf16 = bf16_bits & 0x7F
 
-    # Zero / subnormal
     if exp_bf16 == 0:
         return 0
 
-    # Inf / NaN
     if exp_bf16 == 0xFF:
         if frac_bf16 != 0:
             return 0
         return E4M3_MAX_NEG if sign else E4M3_MAX_POS
 
     scaled_unb_exp = (exp_bf16 - _BF16_BIAS) + scale_exp
-
     mant8 = 0x80 | frac_bf16
     rounded_norm = round_right_shift4_rne(mant8)
 
@@ -172,6 +170,6 @@ def bf16_scale_to_e4m3(bf16_bits: int, scale_exp: int) -> int:
 
 def output_conv_stage(bf16_bits: int, out_fmt_sel, scale_exp: int) -> int:
     bf16_sanitized = sanitize_bf16(bf16_bits)
-    if out_fmt_sel.name == "OutBF16":
+    if out_fmt_sel is OutputFmtSel.OutBF16:
         return bf16_sanitized
     return bf16_scale_to_e4m3(bf16_sanitized, scale_exp) & 0xFF

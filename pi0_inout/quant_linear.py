@@ -6,7 +6,7 @@ to matmul inputs (activation + weight) and matmul output separately.
 
 RTL-backed variant
 ------------------
-This version replaces F.linear(...) with AtlasLinearRTLFunction so the core
+This version replaces F.linear(...) with IPTLinearRTLFunction so the core
 matmul/bias path uses the Python functional model of the RTL MXU.
 
 Important limitations
@@ -44,7 +44,7 @@ from typing import Optional
 
 from .quant_types import QuantFormat, quant
 from .stats_tracker import StatsTracker, Component
-from .rtl_linear import AtlasLinearRTLFunction
+from .ipt_rtl_linear import IPTLinearRTLFunction
 from .fp_formats import OutputFmtSel
 
 
@@ -64,7 +64,7 @@ class QuantLinear(nn.Module):
     """
     Drop-in replacement for nn.Linear with configurable input/output quantization.
 
-    This RTL-backed version uses AtlasLinearRTLFunction instead of F.linear for the
+    This RTL-backed version uses IPTLinearRTLFunction instead of F.linear for the
     quantized path.
 
     Attributes:
@@ -111,7 +111,7 @@ class QuantLinear(nn.Module):
 
         self._validate_rtl_formats()
         self.out_fmt_sel = self._to_output_fmt_sel(output_fmt)
-        self.rtl_linear = AtlasLinearRTLFunction(
+        self.rtl_linear = IPTLinearRTLFunction(
             vec_len=vec_len,
             num_lanes=num_lanes,
             pipeline_depth=pipeline_depth,

@@ -5,7 +5,6 @@ from enum import Enum
 import struct
 
 
-# Bind struct functions once to avoid repeated global attribute lookups.
 _pack = struct.pack
 _unpack = struct.unpack
 
@@ -25,10 +24,6 @@ class AtlasFPType:
 
 E4M3 = AtlasFPType("E4M3", ieeeWidth=8, expWidth=4, mantissaBits=3, ieeeBias=7)
 BF16 = AtlasFPType("BF16", ieeeWidth=16, expWidth=8, mantissaBits=7, ieeeBias=127)
-
-# Hoist common constants used in hot paths.
-_E4M3_BIAS = E4M3.ieeeBias
-_BF16_BIAS = BF16.ieeeBias
 
 
 @dataclass(frozen=True)
@@ -66,6 +61,8 @@ E4M3_MAX_NEG = 0xFE
 F32_SIGN_MASK = 0x80000000
 F32_EXP_MASK = 0x7F800000
 F32_FRAC_MASK = 0x007FFFFF
+
+_E4M3_BIAS = E4M3.ieeeBias
 
 
 @dataclass(frozen=True)
@@ -114,7 +111,7 @@ def wrap_signed(value: int, bits: int) -> int:
     return value
 
 
-def decode_e4m3(bits: int) -> DecodedFloat:
+def _decode_e4m3_uncached(bits: int) -> DecodedFloat:
     bits &= 0xFF
     sign = (bits >> 7) & 1
     exp = (bits >> 3) & 0xF
@@ -127,14 +124,14 @@ def decode_e4m3(bits: int) -> DecodedFloat:
 
         unb_exp = 1 - _E4M3_BIAS
         sig = frac * 0.125
-        v = (-sig if sign else sig) * (2.0 ** unb_exp)
+        mag = sig * (2.0 ** unb_exp)
+        v = -mag if sign else mag
         return DecodedFloat(sign, exp, frac, False, True, False, False, unb_exp, sig, v)
 
     if exp == 0xF:
         if frac == 0:
             v = float("-inf") if sign else float("inf")
             return DecodedFloat(sign, exp, frac, False, False, True, False, None, None, v)
-
         return DecodedFloat(sign, exp, frac, False, False, False, True, None, None, float("nan"))
 
     unb_exp = exp - _E4M3_BIAS
@@ -142,6 +139,13 @@ def decode_e4m3(bits: int) -> DecodedFloat:
     mag = sig * (2.0 ** unb_exp)
     v = -mag if sign else mag
     return DecodedFloat(sign, exp, frac, False, False, False, False, unb_exp, sig, v)
+
+
+_E4M3_DECODE_LUT = tuple(_decode_e4m3_uncached(i) for i in range(256))
+
+
+def decode_e4m3(bits: int) -> DecodedFloat:
+    return _E4M3_DECODE_LUT[bits & 0xFF]
 
 
 def encode_e4m3_normal(sign: int, unb_exp: int, mant3: int) -> int:
