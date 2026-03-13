@@ -44,11 +44,15 @@ def _prod_to_aligned(prod_bits: np.int32, anchor: np.int32) -> np.int64:
     # left_pad = int_width - sig_width = 30 - 8 = 22
     sig_wide = (np.int64(0x80) | np.int64(man)) << np.int64(22)
     rshift   = np.int32(anchor) - (exp_bits - np.int32(13))  # anchor - unb_exp
-    if rshift < np.int32(0):
-        shifted = sig_wide << np.int64(-rshift)
-    else:
-        shifted = sig_wide >> np.int64(rshift)
-    mag = shifted & np.int64(0x3FFFFFFF)
+    """rshift = anchor - unb_exp.  anchor = max_prod_exp + ANCHOR_HR (7), so
+    rshift >= ANCHOR_HR = 7 for every product in the accumulation pass.
+    The left-shift branch is probably dead and omitted."""
+    # if rshift < np.int32(0):
+    #     shifted = sig_wide << np.int64(-rshift)
+    # else:
+    #     shifted = sig_wide >> np.int64(rshift)
+    shifted  = sig_wide >> np.int64(rshift)
+    mag      = shifted & np.int64(0x3FFFFFFF)
     return _wrap30(-mag if sign else mag)
 
 
@@ -226,12 +230,14 @@ def compute_lanes_batch(
         for lane_idx in range(n_lanes):
             weights = wbuf1[lane_idx] if buf_read_sel else wbuf0[lane_idx]
 
-            # ── Pass 1: E4M3 products + max product exponent ─────────────
+            # ── Pass 1: compute + cache E4M3 products, find max exp ──────
+            prods  = np.empty(vec_len, dtype=np.int32)
             max_pe = SENTINEL
             for i in range(vec_len):
                 a    = np.int32(act_row[i])   & np.int32(0xFF)
                 w    = np.int32(weights[i])   & np.int32(0xFF)
                 prod = lut[(a << np.int32(8)) | w]
+                prods[i] = prod
                 exp_bits = (prod >> np.int32(7)) & np.int32(0x1F)
                 pe = SENTINEL if exp_bits == np.int32(0) else (exp_bits - PROD_BIAS)
                 if pe > max_pe:
@@ -254,13 +260,10 @@ def compute_lanes_batch(
 
             anchor = (max_pe if max_pe >= addend_exp else addend_exp) + ANCHOR_HR
 
-            # ── Pass 2: accumulate aligned products ──────────────────────
+            # ── Pass 2: accumulate from cached products ───────────────────
             prod_sum = np.int64(0)
             for i in range(vec_len):
-                a    = np.int32(act_row[i])  & np.int32(0xFF)
-                w    = np.int32(weights[i])  & np.int32(0xFF)
-                prod = lut[(a << np.int32(8)) | w]
-                prod_sum = _wrap30(prod_sum + _prod_to_aligned(prod, anchor))
+                prod_sum = _wrap30(prod_sum + _prod_to_aligned(prods[i], anchor))
 
             # ── Addend ───────────────────────────────────────────────────
             if addend_sel == np.int32(1):

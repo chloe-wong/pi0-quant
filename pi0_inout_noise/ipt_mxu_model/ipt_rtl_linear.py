@@ -2,11 +2,12 @@ import logging
 import math
 from typing import Optional
 
+import numpy as np
 import torch
 
 from .fp_formats import AddendSel, OutputFmtSel
-from .params_and_requests import InnerProductTreeParams, ComputeReq, WeightLoadReq
-from .inner_product_trees_model import InnerProductTreesModel
+from .params_and_requests import InnerProductTreeParams
+from ._numba_kernels import compute_lanes_batch, MUL_LUT
 
 log = logging.getLogger(__name__)
 
@@ -188,10 +189,19 @@ class IPTLinearRTLFunction:
                 out_tile.append(lane_rows)
             prepared_weight_tiles.append((out_base, lane_count, out_tile))
 
+        # Pre-convert weight tiles to numpy arrays so __call__ does not rebuild them.
+        # wbuf_np_tiles[out_tile_idx][k_tile_idx] -> (num_lanes, vec_len) uint8
+        wbuf_np_tiles = []
+        for _, _, out_tile in prepared_weight_tiles:
+            wbuf_np_tiles.append(
+                [np.array(lane_rows, dtype=np.uint8) for lane_rows in out_tile]
+            )
+
         prepared = {
             "key": key,
             "b_e4m3_list": b_e4m3_list,
             "prepared_weight_tiles": prepared_weight_tiles,
+            "wbuf_np_tiles": wbuf_np_tiles,
         }
         self._prepared_cache = prepared
         return prepared
@@ -220,89 +230,70 @@ class IPTLinearRTLFunction:
             batch, in_features, out_features, num_k_tiles, scale_exp,
         )
 
-        x_e4m3 = float_to_e4m3_bytes(x2)
-        x_e4m3_list = x_e4m3.cpu().tolist()
+        # Build activation tile array: (num_k_tiles, batch, vec_len) uint8.
+        # Axis 0 first so each k_tile slice is C-contiguous.
+        x_e4m3_np = float_to_e4m3_bytes(x2).cpu().numpy()  # (batch, in_features)
+        acts_tiles = np.zeros((num_k_tiles, batch, vec_len), dtype=np.uint8)
+        for k in range(num_k_tiles):
+            k0, k1 = k * vec_len, min((k + 1) * vec_len, in_features)
+            acts_tiles[k, :, :k1 - k0] = x_e4m3_np[:, k0:k1]
 
         prepared = self._prepare_static_operands(w_q, b_q, in_features, out_features)
         b_e4m3_list = prepared["b_e4m3_list"]
         prepared_weight_tiles = prepared["prepared_weight_tiles"]
+        wbuf_np_tiles = prepared["wbuf_np_tiles"]
 
-        zero_vec = [0] * vec_len
-        zero_bias = [0] * num_lanes
-        scale_list = [scale_exp] * num_lanes
-
-        x_tiles = []
-        for b_idx in range(batch):
-            row_tiles = []
-            row = x_e4m3_list[b_idx]
-            for k_tile in range(num_k_tiles):
-                k0 = k_tile * vec_len
-                k1 = min(k0 + vec_len, in_features)
-                tile = row[k0:k1]
-                if len(tile) < vec_len:
-                    tile = tile + zero_vec[len(tile):]
-                row_tiles.append(tile)
-            x_tiles.append(row_tiles)
+        sexp_arr = np.full(num_lanes, scale_exp, dtype=np.int32)
+        zero_bias_np = np.zeros(num_lanes, dtype=np.uint8)
 
         y_bits = torch.zeros(batch, out_features, dtype=torch.int32, device=device)
 
         num_out_tiles = len(prepared_weight_tiles)
-        for tile_idx, (out_base, lane_count, out_tile_weights) in enumerate(prepared_weight_tiles):
+        for tile_idx, (out_base, lane_count, _) in enumerate(prepared_weight_tiles):
             log.debug(
                 "  out_tile %d/%d: out_base=%d  lane_count=%d",
                 tile_idx + 1, num_out_tiles, out_base, lane_count,
             )
-            dut = InnerProductTreesModel(self.p)
-            psum_bits = [[0] * num_lanes for _ in range(batch)]
+            k_wbufs = wbuf_np_tiles[tile_idx]
 
             if b_e4m3_list is not None:
-                bias_first_tile = zero_bias.copy()
+                bias_arr = np.zeros(num_lanes, dtype=np.uint8)
                 for lane in range(lane_count):
-                    bias_first_tile[lane] = b_e4m3_list[out_base + lane]
+                    bias_arr[lane] = b_e4m3_list[out_base + lane]
             else:
-                bias_first_tile = zero_bias
+                bias_arr = zero_bias_np
+
+            psum_np = np.zeros((batch, num_lanes), dtype=np.int32)
 
             for k_tile in range(num_k_tiles):
-                lane_rows = out_tile_weights[k_tile]
-                for lane in range(num_lanes):
-                    dut.load_weights(
-                        WeightLoadReq(
-                            weightsDma=lane_rows[lane],
-                            laneIdx=lane,
-                            last=(lane == num_lanes - 1),
-                        )
-                    )
-
                 if k_tile == 0 and b_e4m3_list is not None:
-                    addend_sel = AddendSel.UseBias
-                    bias_list = bias_first_tile
+                    addend_sel = np.int32(AddendSel.UseBias.value)
+                    cur_bias = bias_arr
                 elif k_tile == 0:
-                    addend_sel = AddendSel.UseAct
-                    bias_list = zero_bias
+                    addend_sel = np.int32(AddendSel.UseAct.value)
+                    cur_bias = zero_bias_np
                 else:
-                    addend_sel = AddendSel.UsePsum
-                    bias_list = zero_bias
+                    addend_sel = np.int32(AddendSel.UsePsum.value)
+                    cur_bias = zero_bias_np
                 log.debug(
-                    "    k_tile %d/%d: addend=%s",
-                    k_tile + 1, num_k_tiles, addend_sel.name,
+                    "    k_tile %d/%d: addend=%d",
+                    k_tile + 1, num_k_tiles, addend_sel,
                 )
 
-                for b_idx in range(batch):
-                    req = ComputeReq(
-                        act=x_tiles[b_idx][k_tile],
-                        bias=bias_list,
-                        psum=psum_bits[b_idx],
-                        scaleExp=scale_list,
-                        addendSel=addend_sel,
-                        outFmtSel=self.out_fmt_sel,
-                    )
-                    psum_bits[b_idx] = dut.compute_now(req)
+                wbuf = k_wbufs[k_tile]  # (num_lanes, vec_len) uint8, already numpy
+                psum_np = compute_lanes_batch(
+                    acts_tiles[k_tile],               # (batch, vec_len) – contiguous
+                    wbuf, wbuf,                       # buf_read_sel=False → wbuf0 used
+                    cur_bias,                         # (num_lanes,) uint8
+                    psum_np,                          # (batch, num_lanes) int32
+                    sexp_arr,                         # (num_lanes,) int32
+                    False,
+                    addend_sel,
+                    np.int32(self.out_fmt_sel.value),
+                    MUL_LUT,
+                )
 
-            tile_bits = torch.tensor(
-                [row[:lane_count] for row in psum_bits],
-                dtype=torch.int32,
-                device=device,
-            )
+            tile_bits = torch.from_numpy(psum_np[:, :lane_count]).to(device=device)
             y_bits[:, out_base:out_base + lane_count] = tile_bits
 
         y = decode_model_output_bits(y_bits, self.out_fmt_sel)
