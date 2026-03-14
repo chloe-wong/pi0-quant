@@ -66,7 +66,7 @@ for _p in [str(_PI0_INOUT.parent), str(_CLIENT_SRC), str(_OPENPI_SRC)]:
         sys.path.insert(0, _p)
 
 # ── Inject JAX stubs BEFORE any openpi import ────────────────────────────────
-from pi0_inout_numba._jax_stubs import inject as _inject_jax_stubs   # noqa: E402
+from pi0_inout_ipt_mxu_numba._jax_stubs import inject as _inject_jax_stubs   # noqa: E402
 _inject_jax_stubs()
 
 # ── Now it is safe to import the pytorch model ────────────────────────────────
@@ -74,16 +74,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# ── pi0_inout_noise imports (quantization layer) ──────────────────────────────
-from pi0_inout_numba.quant_types import QuantFormat, TORCH_DTYPE, FORMAT_BITS, set_fp8_mode
-from pi0_inout_numba.model_patcher import (
+# ── pi0_inout_ipt_mxu_numba imports (quantization layer) ─────────────────────
+from pi0_inout_ipt_mxu_numba.quant_types import QuantFormat, TORCH_DTYPE, FORMAT_BITS, set_fp8_mode
+from pi0_inout_ipt_mxu_numba.model_patcher import (
     patch_model, list_linear_layers,
     QuantGroup, ALL_GROUPS,
     patch_attn_sdpa, unpatch_attn_sdpa,
 )
-from pi0_inout_numba.quant_linear import QuantLinear
-from pi0_inout_numba.stats_tracker import StatsTracker
-from pi0_inout_numba.rel_noise import RelNoiseConfig
+from pi0_inout_ipt_mxu_numba.quant_linear import QuantLinear
+from pi0_inout_ipt_mxu_numba.stats_tracker import StatsTracker
+from pi0_inout_ipt_mxu_numba.rel_noise import RelNoiseConfig
 
 
 # ---------------------------------------------------------------------------
