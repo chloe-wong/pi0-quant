@@ -3,9 +3,13 @@ from typing import Optional
 
 import torch
 
-from fp_formats import AddendSel, OutputFmtSel
-from params_and_requests import InnerProductTreeParams, ComputeReq, WeightLoadReq
-from inner_product_trees_model import InnerProductTreesModel
+from pi0_inout_c.ipt_mxu_model.fp_formats import AddendSel, OutputFmtSel
+from pi0_inout_c.ipt_mxu_model.params_and_requests import (
+    InnerProductTreeParams,
+    ComputeReq,
+    WeightLoadReq,
+)
+from pi0_inout_c.ipt_mxu_model.inner_product_trees_model import InnerProductTreesModel
 
 
 _E4M3_FLOAT_LUT = torch.zeros(256, dtype=torch.float32)
@@ -54,7 +58,7 @@ def _float_to_e4m3_byte_scalar(v: float) -> int:
     if exp < -6:
         return 0
 
-    mant = a / (2.0 ** exp)
+    mant = a / (2.0**exp)
     frac = int(round((mant - 1.0) * 8.0))
 
     if frac == 8:
@@ -80,7 +84,9 @@ def e4m3_bytes_to_float(x: torch.Tensor) -> torch.Tensor:
     return lut[(x.to(torch.int64) & 0xFF)]
 
 
-def decode_model_output_bits(out_bits: torch.Tensor, out_fmt_sel: OutputFmtSel) -> torch.Tensor:
+def decode_model_output_bits(
+    out_bits: torch.Tensor, out_fmt_sel: OutputFmtSel
+) -> torch.Tensor:
     if out_fmt_sel is OutputFmtSel.OutBF16:
         return torch_bf16_bits_to_float(out_bits.to(torch.int32))
     e4m3_bytes = (out_bits & 0xFF).to(torch.uint8)
@@ -222,7 +228,7 @@ class IPTLinearRTLFunction:
                 k1 = min(k0 + vec_len, in_features)
                 tile = row[k0:k1]
                 if len(tile) < vec_len:
-                    tile = tile + zero_vec[len(tile):]
+                    tile = tile + zero_vec[len(tile) :]
                 row_tiles.append(tile)
             x_tiles.append(row_tiles)
 
@@ -276,7 +282,7 @@ class IPTLinearRTLFunction:
                 dtype=torch.int32,
                 device=device,
             )
-            y_bits[:, out_base:out_base + lane_count] = tile_bits
+            y_bits[:, out_base : out_base + lane_count] = tile_bits
 
         y = decode_model_output_bits(y_bits, self.out_fmt_sel)
         return y.reshape(*original_shape, out_features)

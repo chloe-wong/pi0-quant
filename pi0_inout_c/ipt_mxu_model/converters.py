@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from fp_formats import (
+from pi0_inout_c.ipt_mxu_model.fp_formats import (
     BF16,
     E4M3ProdFmt,
     E4M3_MAX_NEG,
@@ -42,7 +42,7 @@ def _build_e4m3_mul_to_prod_lut() -> None:
         a_exp = (a_bits >> 3) & 0xF
         a_man = a_bits & 0x7
 
-        a_zero = (a_exp == 0)
+        a_zero = a_exp == 0
 
         for b_bits in range(256):
             b_sign = (b_bits >> 7) & 1
@@ -64,7 +64,9 @@ def _build_e4m3_mul_to_prod_lut() -> None:
             out_man = (prod_sig & 0x7F) if need_shift else ((prod_sig & 0x3F) << 1)
             out_exp = a_exp + b_exp + need_shift - 1
 
-            _E4M3_MUL_TO_PROD_LUT[idx] = (out_sign << 12) | ((out_exp & 0x1F) << 7) | out_man
+            _E4M3_MUL_TO_PROD_LUT[idx] = (
+                (out_sign << 12) | ((out_exp & 0x1F) << 7) | out_man
+            )
             idx += 1
 
 

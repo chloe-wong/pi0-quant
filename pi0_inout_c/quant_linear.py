@@ -44,8 +44,8 @@ from typing import Optional
 
 from .quant_types import QuantFormat, quant
 from .stats_tracker import StatsTracker, Component
-from .ipt_rtl_linear import IPTLinearRTLFunction
-from .fp_formats import OutputFmtSel
+from pi0_inout_c.ipt_mxu_model.ipt_rtl_linear import IPTLinearRTLFunction
+from pi0_inout_c.ipt_mxu_model.fp_formats import OutputFmtSel
 
 
 _SUPPORTED_E4M3_NAMES = {
@@ -93,15 +93,15 @@ class QuantLinear(nn.Module):
     ) -> None:
         super().__init__()
         self.weight = linear.weight
-        self.bias   = linear.bias
+        self.bias = linear.bias
 
-        self.input_fmt  = input_fmt
+        self.input_fmt = input_fmt
         self.output_fmt = output_fmt
-        self.component  = component
+        self.component = component
         self.layer_name = layer_name
-        self.tracker    = tracker
+        self.tracker = tracker
 
-        self.in_features  = linear.in_features
+        self.in_features = linear.in_features
         self.out_features = linear.out_features
 
         self.vec_len = vec_len

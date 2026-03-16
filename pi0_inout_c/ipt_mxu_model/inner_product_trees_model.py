@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from collections import deque
 
-from fp_formats import AddendSel, E4M3ProdFmt, wrap_signed
-from params_and_requests import ComputeReq, WeightLoadReq, StepResult, InnerProductTreeParams
-from converters import (
+from pi0_inout_c.ipt_mxu_model.fp_formats import AddendSel, E4M3ProdFmt, wrap_signed
+from pi0_inout_c.ipt_mxu_model.params_and_requests import (
+    ComputeReq,
+    WeightLoadReq,
+    StepResult,
+    InnerProductTreeParams,
+)
+from pi0_inout_c.ipt_mxu_model.converters import (
     e4m3_mul_to_prod,
     e4m3_prod_to_aligned_int,
     ieee_to_aligned_int,
@@ -81,12 +86,16 @@ class AnchorAccumulationTreeModel:
             if not psum_is_zero:
                 addend_exp = psum_exp_field - self._psum_bias
 
-        anchor = (max_prod_exp if max_prod_exp >= addend_exp else addend_exp) + self._anchor_headroom
+        anchor = (
+            max_prod_exp if max_prod_exp >= addend_exp else addend_exp
+        ) + self._anchor_headroom
 
         int_width = self._int_width
         prod_sum = 0
         for prod in prod_s0:
-            prod_sum = wrap_signed(prod_sum + e4m3_prod_to_aligned_int(prod, anchor, int_width), int_width)
+            prod_sum = wrap_signed(
+                prod_sum + e4m3_prod_to_aligned_int(prod, anchor, int_width), int_width
+            )
 
         if addend_sel is AddendSel.UseBias:
             addend_int = ieee_to_aligned_int(bias, self.p.biasFmt, anchor, int_width)
@@ -167,17 +176,20 @@ class InnerProductTreesModel:
 
         out = [0] * num_lanes
         for lane_idx in range(num_lanes):
-            out[lane_idx] = lanes[lane_idx].compute_lane(
-                act=act_masked,
-                weight_buf0=wbuf0[lane_idx],
-                weight_buf1=wbuf1[lane_idx],
-                bias=bias[lane_idx] & 0xFF,
-                psum=psum[lane_idx] & 0xFFFF,
-                scale_exp=scale_exp[lane_idx],
-                buf_read_sel=buf_read_sel,
-                addend_sel=addend_sel,
-                out_fmt_sel=out_fmt_sel,
-            ) & 0xFFFF
+            out[lane_idx] = (
+                lanes[lane_idx].compute_lane(
+                    act=act_masked,
+                    weight_buf0=wbuf0[lane_idx],
+                    weight_buf1=wbuf1[lane_idx],
+                    bias=bias[lane_idx] & 0xFF,
+                    psum=psum[lane_idx] & 0xFFFF,
+                    scale_exp=scale_exp[lane_idx],
+                    buf_read_sel=buf_read_sel,
+                    addend_sel=addend_sel,
+                    out_fmt_sel=out_fmt_sel,
+                )
+                & 0xFFFF
+            )
 
         return out
 
