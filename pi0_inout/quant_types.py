@@ -14,10 +14,11 @@ Three FP8 scaling modes are supported (selected via set_fp8_mode):
       clamped to ±fp8_max, and subnormals below fp8_min are flushed to zero.
       Tests raw FP8 without any dynamic range adjustment.
 
-  "mx"       — MX-compliant power-of-two block scaling (OCP MX spec §6.3).
+  "mx"       — MX-style power-of-two per-tensor scaling (inspired by OCP MX spec §6.3).
       scale = largest power-of-two <= max(|x|) / fp8_max_po2
       where fp8_max_po2 is the largest power-of-two representable in the
       element type.  Out-of-range normals are clamped after scaling.
+      Note: uses per-tensor granularity, not the 32-element blocks of the full MX spec.
 
 BFLOAT16 is the baseline (native model dtype): a bf16->bf16 round-trip is
 a no-op for bf16 weights/activations, giving zero quantization RMSE.
@@ -198,18 +199,22 @@ def _quant_fp8_clamped(x: torch.Tensor, fmt: QuantFormat) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Mode 3: MX-compliant power-of-two block scaling (OCP MX spec §6.3)
+# Mode 3: MX-style power-of-two per-tensor scaling (inspired by OCP MX spec §6.3)
 # ---------------------------------------------------------------------------
 
 def _quant_fp8_mx(x: torch.Tensor, fmt: QuantFormat) -> torch.Tensor:
     """
-    MX-compliant power-of-two block scaling.
+    MX-style power-of-two per-tensor scaling.
 
-    Per OCP MX spec §6.3:
+    Uses the MX spec's scaling algorithm (power-of-two scales) but applied
+    at per-tensor granularity rather than the 32-element block granularity
+    prescribed by the full OCP MX spec.
+
+    Steps (per OCP MX spec §6.3 scaling formula):
     1. X = largest power-of-two <= max(|V|) / fp8_max_po2
     2. P_i = clamp(V_i / X, ±fp8_max) cast to element dtype (RNE)
 
-    The block scale X is a power-of-two, so division by X is exact
+    The scale X is a power-of-two, so division by X is exact
     (just an exponent shift — no rounding from the scaling itself).
     """
     target = TORCH_DTYPE[fmt]
@@ -222,7 +227,7 @@ def _quant_fp8_mx(x: torch.Tensor, fmt: QuantFormat) -> torch.Tensor:
     if amax == 0:
         return x_f32.to(x.dtype)
 
-    # Step 1: block scale = largest po2 <= amax / fp8_max_po2
+    # Step 1: per-tensor scale = largest po2 <= amax / fp8_max_po2
     raw_scale = amax / fp8_max_po2
     # floor to power-of-two: 2^floor(log2(raw_scale))
     log2_scale = math.floor(math.log2(raw_scale.item()))
