@@ -13,18 +13,18 @@ How it works
 3. Instantiates PI0Pytorch from a hardcoded config dict for the known
    training configs (no JAX config system required).
 4. Loads weights from a local safetensors checkpoint if available.
-5. Patches every nn.Linear with QuantLinear (input_fmt / output_fmt).
+5. Patches every nn.Linear with QuantLinear (mx_input_fmt / mx_output_fmt).
 6. Serves via the openpi WebSocket protocol (msgpack + websockets).
 7. On SIGTERM/SIGINT, writes per-layer RMSE stats to --stats-output.
 
 Quantization semantics (unchanged from quant_linear.py)
 ---------------------------------------------------------
 For each nn.Linear:
-    x_q  = quant(x,    input_fmt)
-    W_q  = quant(W,    input_fmt)
-    b_q  = quant(bias, input_fmt)          # bias loaded in input_fmt
+    x_q  = quant(x,    mx_input_fmt)
+    W_q  = quant(W,    mx_input_fmt)
+    b_q  = quant(bias, mx_input_fmt)       # bias loaded in mx_input_fmt
     y    = F.linear(x_q, W_q, b_q)        # float32 accumulation
-    out  = quant(y, output_fmt)            # single output quantization
+    out  = quant(y, mx_output_fmt)         # single output quantization
 
 BFLOAT16/BFLOAT16 is the identity — zero RMSE baseline.
 
@@ -34,7 +34,7 @@ Usage
         --openpi-dir /path/to/openpi \\
         --checkpoint-dir /path/to/model.safetensors_dir \\
         --config pi05_droid_jointpos_polaris \\
-        --input-fmt float8_e4m3 --output-fmt float16 \\
+        --mx-input-fmt float8_e4m3 --mx-output-fmt float16 \\
         --port 8003 --gpu 0
 """
 
@@ -281,8 +281,8 @@ def _load_norm_stats(norm_stats_dir: str) -> dict:
 
 def print_quant_diagnostics(
     model: nn.Module,
-    input_fmt: QuantFormat,
-    output_fmt: QuantFormat,
+    mx_input_fmt: QuantFormat,
+    mx_output_fmt: QuantFormat,
 ) -> None:
     """
     Print model structure and memory analysis after quantization patching.
@@ -320,20 +320,20 @@ def print_quant_diagnostics(
 
     # 2. Print a few representative QuantLinear layers
     print(f"\n[2] Sample QuantLinear layers (first 5):")
-    print(f"    {'Name':<60s}  {'Weight dtype':<12s}  input_fmt    output_fmt")
+    print(f"    {'Name':<60s}  {'Weight dtype':<12s}  mx_input_fmt    mx_output_fmt")
     print("    " + "-" * 110)
     count = 0
     for name, module in model.named_modules():
         if isinstance(module, QuantLinear):
             print(f"    {name:<60s}  {str(module.weight.dtype):<12s}  "
-                  f"{module.input_fmt.value:<12s} {module.output_fmt.value}")
+                  f"{module.mx_input_fmt.value:<15s} {module.mx_output_fmt.value}")
             count += 1
             if count >= 5:
                 print(f"    ... ({n_quant - 5} more)")
                 break
 
     # 3. Memory analysis
-    input_bits = FORMAT_BITS[input_fmt]["total"]
+    input_bits = FORMAT_BITS[mx_input_fmt]["total"]
     bf16_bits = 16
 
     # Actual memory used (weights stay in original dtype)
@@ -364,12 +364,12 @@ def print_quant_diagnostics(
 
     print(f"\n[3] Memory analysis:")
     print(f"    Actual GPU memory (weights in original dtype): {actual_bytes / 1e9:.3f} GB")
-    print(f"    Hypothetical if stored as {input_fmt.value}:   {hypothetical_bytes / 1e9:.3f} GB")
+    print(f"    Hypothetical if stored as {mx_input_fmt.value}:   {hypothetical_bytes / 1e9:.3f} GB")
     print(f"    Reference bf16 size (linear params only):      {bf16_bytes / 1e9:.3f} GB")
     print(f"    Compression ratio (hypothetical vs bf16):      {bf16_bytes / max(hypothetical_bytes, 1):.2f}x")
     print(f"    NOTE: Actual memory is UNCHANGED — this is simulated quantization.")
     print(f"          Weights are stored in {sample_layer[1].weight.dtype if sample_layer else 'N/A'}, "
-          f"cast through {input_fmt.value} at runtime.")
+          f"cast through {mx_input_fmt.value} at runtime.")
 
     # 4. Verify quantization actually changes values (pick one weight tensor)
     if sample_layer is not None:
@@ -389,9 +389,9 @@ def print_quant_diagnostics(
               f"({100 * n_changed / n_total:.1f}%)")
         print(f"    Max abs difference:  {diff.max().item():.6e}")
         print(f"    Mean abs difference: {diff.mean().item():.6e}")
-        if n_changed == 0 and input_fmt != QuantFormat.BFLOAT16:
+        if n_changed == 0 and mx_input_fmt != QuantFormat.BFLOAT16:
             print(f"    WARNING: No values changed! Quantization may not be working.")
-        elif input_fmt == QuantFormat.BFLOAT16:
+        elif mx_input_fmt == QuantFormat.BFLOAT16:
             print(f"    OK: BFLOAT16 baseline — zero difference expected (no-op).")
         else:
             print(f"    OK: Quantization is actively rounding values.")
@@ -633,16 +633,16 @@ def main() -> None:
     set_fp8_mode(args.fp8_mode)
     logger.info(f"FP8 quantization mode: {args.fp8_mode}")
 
-    input_fmt  = QuantFormat(args.input_fmt)
-    output_fmt = QuantFormat(args.output_fmt)
+    mx_input_fmt  = QuantFormat(args.mx_input_fmt)
+    mx_output_fmt = QuantFormat(args.mx_output_fmt)
 
     active_groups = {QuantGroup(g) for g in args.quantize_components}
 
     tracker = StatsTracker()
     patch_model(
         model=model,
-        input_fmt=input_fmt,
-        output_fmt=output_fmt,
+        mx_input_fmt=mx_input_fmt,
+        mx_output_fmt=mx_output_fmt,
         tracker=tracker,
         active_groups=active_groups,
         verbose=False,
@@ -650,17 +650,17 @@ def main() -> None:
     attn_handles = patch_attn_sdpa(
         model=model,
         active_groups=active_groups,
-        input_fmt=input_fmt,
-        output_fmt=output_fmt,
+        mx_input_fmt=mx_input_fmt,
+        mx_output_fmt=mx_output_fmt,
         tracker=tracker,
     )
     logger.info(
-        f"Model patched: input_fmt={input_fmt.value}  output_fmt={output_fmt.value}  "
+        f"Model patched: mx_input_fmt={mx_input_fmt.value}  mx_output_fmt={mx_output_fmt.value}  "
         f"components={args.quantize_components}"
     )
 
     # ── Print quantization diagnostics ────────────────────────────────────
-    print_quant_diagnostics(model, input_fmt, output_fmt)
+    print_quant_diagnostics(model, mx_input_fmt, mx_output_fmt)
 
     # ── Register stats dump on exit ───────────────────────────────────────
     def _dump_stats() -> None:
@@ -716,7 +716,7 @@ def main() -> None:
     from openpi.serving import websocket_policy_server
     import socket
     logger.info(f"Starting server on {socket.gethostname()}:{args.port}  "
-                f"(input={input_fmt.value}, output={output_fmt.value})")
+                f"(mx_input={mx_input_fmt.value}, mx_output={mx_output_fmt.value})")
 
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
@@ -752,11 +752,11 @@ def parse_args() -> argparse.Namespace:
                    help="CUDA device index (-1 for CPU)")
 
     # Quantization
-    p.add_argument("--input-fmt",  default="bfloat16",
+    p.add_argument("--mx-input-fmt",  default="bfloat16",
                    choices=[f.value for f in QuantFormat])
-    p.add_argument("--output-fmt", default="bfloat16",
+    p.add_argument("--mx-output-fmt", default="bfloat16",
                    choices=[f.value for f in QuantFormat])
-    p.add_argument("--fp8-mode", default="scaled",
+    p.add_argument("--fp8-mode", default="po2",
                    choices=["scaled", "clamped", "mx"],
                    help="FP8 quantization mode: "
                         "'scaled' = per-tensor absmax (default), "

@@ -183,10 +183,17 @@ class StatsTracker:
         report = tracker.summary()
         report.print()
         df = report.to_dataframe()   # requires pandas
+
+    Per-call records:
+        tracker.calls — list of dicts, one per record() call, in order:
+            {seq, name, component, rmse, ref_rms, y_quant_rms}
+        seq is a global counter incremented on every record() call.
     """
 
     def __init__(self) -> None:
         self._layers: Dict[str, LayerStats] = {}
+        self.calls: List[dict] = []      # per-call records in execution order
+        self._seq: int = 0               # global sequence counter
 
     def register(
         self,
@@ -213,14 +220,34 @@ class StatsTracker:
     ) -> None:
         """Called by QuantLinear.forward() after each matmul."""
         if name not in self._layers:
-            # Auto-register if not pre-registered
+            # Auto-register if not pre-registered.
+            # 0-D scalar outputs (e.g. from sum/amax reductions) have no feature dim.
+            feat = y_quant.shape[-1] if y_quant.dim() > 0 else 1
             self._layers[name] = LayerStats(
                 name=name,
                 component=component,
-                in_features=y_quant.shape[-1],
-                out_features=y_quant.shape[-1],
+                in_features=feat,
+                out_features=feat,
             )
         self._layers[name].update(y_fp, y_quant)
+
+        # Per-call record (execution order)
+        with torch.no_grad():
+            y_fp_f = y_fp.float()
+            y_q_f  = y_quant.float()
+            diff   = y_fp_f - y_q_f
+            mse    = diff.pow(2).mean().item()
+            fp_ms  = y_fp_f.pow(2).mean().item()
+            q_ms   = y_q_f.pow(2).mean().item()
+        self.calls.append({
+            "seq":         self._seq,
+            "name":        name,
+            "component":   component.value if isinstance(component, Component) else str(component),
+            "rmse":        math.sqrt(max(mse, 0.0)),
+            "ref_rms":     math.sqrt(max(fp_ms, 0.0)),
+            "quant_rms":   math.sqrt(max(q_ms, 0.0)),
+        })
+        self._seq += 1
 
     def reset(self) -> None:
         """Reset all accumulated statistics (e.g., between evaluation episodes)."""
@@ -229,6 +256,8 @@ class StatsTracker:
             stats._mean_mse = 0.0
             stats._M2 = 0.0
             stats._mean_fp_ms = 0.0
+        self.calls.clear()
+        self._seq = 0
 
     def layer_rows(self) -> List[dict]:
         """Return a list of dicts (one per layer), sorted by component then name."""

@@ -38,8 +38,8 @@ Usage:
     # Run only specific format pairs
     python run_benchmark.py \\
         --sim-evals-dir /path/to/sim-evals \\
-        --input-fmts float32 float8_e4m3 \\
-        --output-fmts float32 float16
+        --mx-input-fmts float32 float8_e4m3 \\
+        --mx-output-fmts float32 float16
 
     # Resume a partial run (skips combos that already have stats.json)
     python run_benchmark.py ... --resume
@@ -80,8 +80,8 @@ def format_pairs(input_fmts: list[str], output_fmts: list[str]) -> list[tuple[st
     return [(inf, outf) for inf in input_fmts for outf in output_fmts]
 
 
-def combo_name(input_fmt: str, output_fmt: str) -> str:
-    return f"{input_fmt}__{output_fmt}"
+def combo_name(mx_input_fmt: str, mx_output_fmt: str) -> str:
+    return f"{mx_input_fmt}__{mx_output_fmt}"
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +122,8 @@ def wait_for_port(port: int, timeout: float = 300.0, interval: float = 2.0) -> b
 def start_server(
     args: argparse.Namespace,
     port: int,
-    input_fmt: str,
-    output_fmt: str,
+    mx_input_fmt: str,
+    mx_output_fmt: str,
     stats_path: Path,
 ) -> subprocess.Popen:
     """
@@ -144,8 +144,8 @@ def start_server(
         "--checkpoint-dir", args.checkpoint_dir,
         "--port",           str(port),
         "--gpu",            str(args.gpu),
-        "--input-fmt",      input_fmt,
-        "--output-fmt",     output_fmt,
+        "--mx-input-fmt",   mx_input_fmt,
+        "--mx-output-fmt",  mx_output_fmt,
         "--stats-output",   str(stats_path),
     ]
     if args.openpi_dir:
@@ -298,34 +298,34 @@ def run_eval(
 
 def run_one_combo(
     args: argparse.Namespace,
-    input_fmt: str,
-    output_fmt: str,
+    mx_input_fmt: str,
+    mx_output_fmt: str,
     output_dir: Path,
     port: int,
 ) -> dict:
     """
-    Run the full pipeline for one (input_fmt, output_fmt) pair.
+    Run the full pipeline for one (mx_input_fmt, mx_output_fmt) pair.
     Returns a dict with all results merged.
     """
     stats_path = output_dir / "stats.json"
-    combo = combo_name(input_fmt, output_fmt)
+    combo = combo_name(mx_input_fmt, mx_output_fmt)
 
     logger.info(f"\n{'─'*60}")
-    logger.info(f"  Config: input={input_fmt}  output={output_fmt}")
+    logger.info(f"  Config: mx_input={mx_input_fmt}  mx_output={mx_output_fmt}")
     logger.info(f"  Output: {output_dir}")
 
     # --- Start server --------------------------------------------------------
-    server_proc = start_server(args, port, input_fmt, output_fmt, stats_path)
+    server_proc = start_server(args, port, mx_input_fmt, mx_output_fmt, stats_path)
 
     try:
         logger.info(f"  Waiting for server on port {port}...")
         if not wait_for_port(port, timeout=args.server_timeout):
             logger.error(f"  Server did not start within {args.server_timeout}s")
             return {
-                "combo":      combo,
-                "input_fmt":  input_fmt,
-                "output_fmt": output_fmt,
-                "error":      "server_start_timeout",
+                "combo":         combo,
+                "mx_input_fmt":  mx_input_fmt,
+                "mx_output_fmt": mx_output_fmt,
+                "error":         "server_start_timeout",
             }
         logger.info(f"  Server ready on port {port}")
 
@@ -355,9 +355,9 @@ def run_one_combo(
 
     # --- Build result record -------------------------------------------------
     result = {
-        "combo":        combo,
-        "input_fmt":    input_fmt,
-        "output_fmt":   output_fmt,
+        "combo":         combo,
+        "mx_input_fmt":  mx_input_fmt,
+        "mx_output_fmt": mx_output_fmt,
         # Benchmark
         "success_rate": eval_results.get("success_rate"),
         "by_scene":     eval_results.get("by_scene", {}),
@@ -393,7 +393,7 @@ def main(args: argparse.Namespace) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output root: {output_root}")
 
-    pairs = format_pairs(args.input_fmts, args.output_fmts)
+    pairs = format_pairs(args.mx_input_fmts, args.mx_output_fmts)
     logger.info(f"Format combinations: {len(pairs)}")
     for inf, outf in pairs:
         logger.info(f"  {inf} × {outf}")
@@ -401,8 +401,8 @@ def main(args: argparse.Namespace) -> None:
     all_results = []
     port = find_free_port(args.port)
 
-    for i, (input_fmt, output_fmt) in enumerate(pairs):
-        name = combo_name(input_fmt, output_fmt)
+    for i, (mx_input_fmt, mx_output_fmt) in enumerate(pairs):
+        name = combo_name(mx_input_fmt, mx_output_fmt)
         combo_dir = output_root / name
         combo_dir.mkdir(exist_ok=True)
 
@@ -414,7 +414,7 @@ def main(args: argparse.Namespace) -> None:
             continue
 
         logger.info(f"\n[{i+1}/{len(pairs)}] Running {name}")
-        result = run_one_combo(args, input_fmt, output_fmt, combo_dir, port)
+        result = run_one_combo(args, mx_input_fmt, mx_output_fmt, combo_dir, port)
         all_results.append(result)
 
         # Write running summary after each combo (safe if interrupted)
@@ -461,14 +461,14 @@ def _print_summary_table(results: list[dict]) -> None:
     print(f"\n{'='*80}")
     print(f"  RESULTS SUMMARY")
     print(f"{'='*80}")
-    header = f"{'input':12s}  {'output':12s}  {'success':8s}  {'rmse_vision':12s}  {'rmse_lang':12s}  {'rmse_act':10s}"
+    header = f"{'mx_input':12s}  {'mx_output':12s}  {'success':8s}  {'rmse_vision':12s}  {'rmse_lang':12s}  {'rmse_act':10s}"
     print(header)
     print("-" * len(header))
     for r in results:
         rmse = r.get("component_rmse", {})
         success = r.get("success_rate")
         print(
-            f"{r['input_fmt']:12s}  {r['output_fmt']:12s}  "
+            f"{r['mx_input_fmt']:12s}  {r['mx_output_fmt']:12s}  "
             f"{(f'{success:.2f}' if success is not None else 'N/A'):8s}  "
             f"{_fmtf(rmse.get('vision')):12s}  "
             f"{_fmtf(rmse.get('language')):12s}  "
@@ -513,10 +513,10 @@ def parse_args() -> argparse.Namespace:
                         "Otherwise sys.executable is used (must have torch+openpi).")
 
     # Format sweep
-    p.add_argument("--input-fmts", nargs="+", default=ALL_FORMATS,
+    p.add_argument("--mx-input-fmts", nargs="+", default=ALL_FORMATS,
                    choices=ALL_FORMATS,
                    help="Input formats to sweep (default: all 5)")
-    p.add_argument("--output-fmts", nargs="+", default=ALL_FORMATS,
+    p.add_argument("--mx-output-fmts", nargs="+", default=ALL_FORMATS,
                    choices=ALL_FORMATS,
                    help="Output formats to sweep (default: all 5)")
 

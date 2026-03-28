@@ -11,6 +11,7 @@ sweep_results/
 *.json
 *.csv
 *.mp4
+ablation_plots.png
 
 # Checkpoints and data
 *.safetensors

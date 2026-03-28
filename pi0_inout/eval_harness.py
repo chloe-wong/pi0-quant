@@ -62,19 +62,19 @@ class QuantConfig:
     """
     Describes one quantization experiment.
 
-    input_fmt:   Format for both activations and weights entering the matmul.
-    output_fmt:  Format for the matmul output.
+    mx_input_fmt:    Format for both activations and weights entering the matmul.
+    mx_output_fmt:   Format for the matmul output.
     skip_components: Components to leave at full precision (useful for ablations).
-    label:       Human-readable name for this configuration.
+    label:           Human-readable name for this configuration.
     """
-    input_fmt:  QuantFormat = QuantFormat.BFLOAT16
-    output_fmt: QuantFormat = QuantFormat.BFLOAT16
+    mx_input_fmt:  QuantFormat = QuantFormat.BFLOAT16
+    mx_output_fmt: QuantFormat = QuantFormat.BFLOAT16
     skip_components: frozenset[Component] = field(default_factory=frozenset)
     label: str = ""
 
     def __post_init__(self):
         if not self.label:
-            self.label = f"in={self.input_fmt.value}_out={self.output_fmt.value}"
+            self.label = f"in={self.mx_input_fmt.value}_out={self.mx_output_fmt.value}"
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +108,8 @@ class EvalResult:
     def to_dict(self) -> dict:
         return {
             "config":           self.config.label,
-            "input_fmt":        self.config.input_fmt.value,
-            "output_fmt":       self.config.output_fmt.value,
+            "mx_input_fmt":     self.config.mx_input_fmt.value,
+            "mx_output_fmt":    self.config.mx_output_fmt.value,
             "action_rmse":      self.action_rmse,
             "action_rmse_by_component": self.action_rmse_per_component,
             "n_observations":   self.n_observations,
@@ -171,8 +171,8 @@ def run_quantization_eval(
     tracker = StatsTracker()
     patch_model(
         model=model,
-        input_fmt=config.input_fmt,
-        output_fmt=config.output_fmt,
+        mx_input_fmt=config.mx_input_fmt,
+        mx_output_fmt=config.mx_output_fmt,
         tracker=tracker,
         skip_components=set(config.skip_components),
         verbose=False,
@@ -304,8 +304,8 @@ def default_sweep_configs(
     for inf in input_formats:
         for outf in output_formats:
             configs.append(QuantConfig(
-                input_fmt=inf,
-                output_fmt=outf,
+                mx_input_fmt=inf,
+                mx_output_fmt=outf,
                 label=f"in={inf.value}_out={outf.value}",
             ))
     return configs
@@ -329,8 +329,8 @@ def results_to_dataframe(results: List[EvalResult]):
     for r in results:
         base = {
             "config":           r.config.label,
-            "input_fmt":        r.config.input_fmt.value,
-            "output_fmt":       r.config.output_fmt.value,
+            "mx_input_fmt":     r.config.mx_input_fmt.value,
+            "mx_output_fmt":    r.config.mx_output_fmt.value,
             "action_rmse":      r.action_rmse,
             "n_observations":   r.n_observations,
             "inference_time_s": r.inference_time_s,

@@ -18,8 +18,8 @@ Quick start:
 
     patch_model(
         model,
-        input_fmt=QuantFormat.FLOAT8_E4M3,
-        output_fmt=QuantFormat.FLOAT16,
+        mx_input_fmt=QuantFormat.FLOAT8_E4M3,
+        mx_output_fmt=QuantFormat.FLOAT16,
         tracker=tracker,
     )
 
@@ -30,6 +30,7 @@ Quick start:
 
 from .quant_types   import QuantFormat, quant, TORCH_DTYPE, FORMAT_BITS, all_formats, sweep_pairs, set_fp8_mode, get_fp8_mode
 from .quant_linear  import QuantLinear
+from .rel_noise     import RelNoiseConfig, inject_rel_noise
 from .model_patcher import (
     patch_model, unpatch_model, count_layers, list_linear_layers,
     QuantAttnContext,
@@ -39,6 +40,11 @@ from .model_patcher import (
 from .quant_vector import (
     patch_vector_ops, unpatch_vector_ops,
     VectorQuantMode, TARGET_OPS,
+)
+from .functional_models import (
+    register_functional_model,
+    get_functional_model_factory,
+    list_functional_models,
 )
 from .stats_tracker import StatsTracker, Component, StatsReport
 from .eval_harness  import (
@@ -63,6 +69,9 @@ __all__ = [
     "get_fp8_mode",
     # Core modules
     "QuantLinear",
+    # Noise injection
+    "RelNoiseConfig",
+    "inject_rel_noise",
     # Patching
     "patch_model",
     "unpatch_model",
@@ -78,6 +87,10 @@ __all__ = [
     "unpatch_vector_ops",
     "VectorQuantMode",
     "TARGET_OPS",
+    # Functional model registry
+    "register_functional_model",
+    "get_functional_model_factory",
+    "list_functional_models",
     # Stats
     "StatsTracker",
     "Component",

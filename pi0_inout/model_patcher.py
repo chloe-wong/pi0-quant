@@ -161,10 +161,11 @@ def _active_components(active_groups: set[QuantGroup]) -> set[Component]:
 
 def patch_model(
     model: nn.Module,
-    input_fmt: QuantFormat,
-    output_fmt: QuantFormat,
+    mx_input_fmt: QuantFormat,
+    mx_output_fmt: QuantFormat,
     tracker: Optional[StatsTracker] = None,
     active_groups: Optional[set[QuantGroup]] = None,
+    functional_model_factory=None,
     verbose: bool = False,
 ) -> nn.Module:
     """
@@ -173,20 +174,33 @@ def patch_model(
     The model is modified in-place and also returned for convenience.
 
     Args:
-        model:         The Pi0Pytorch model (or any nn.Module).
-        input_fmt:     QuantFormat applied to activation + weight before the matmul.
-        output_fmt:    QuantFormat applied to the matmul output.
-        tracker:       Optional StatsTracker.  If provided, each QuantLinear
-                       will compute RMSE against fp32 and report to the tracker.
-        active_groups: Which QuantGroups to quantize.  None means all three
-                       (VISION + TRANSFORMER + ACTION_HEAD).  Pass a subset
-                       to restrict quantization to those groups only, e.g.:
-                           active_groups={QuantGroup.TRANSFORMER}
-        verbose:       If True, print each replaced layer.
+        model:                    The Pi0Pytorch model (or any nn.Module).
+        mx_input_fmt:             QuantFormat applied to activation + weight before the
+                                  matmul.  Ignored when functional_model_factory is set.
+        mx_output_fmt:            QuantFormat applied to the matmul output.
+                                  Ignored when functional_model_factory is set.
+        tracker:                  Optional StatsTracker.  If provided, each QuantLinear
+                                  will compute RMSE against fp32 and report to the tracker.
+        active_groups:            Which QuantGroups to quantize.  None means all groups.
+                                  Pass a subset to restrict quantization, e.g.:
+                                      active_groups={QuantGroup.TRANSFORMER}
+        functional_model_factory: Optional callable (in_features, out_features) -> model.
+                                  When provided, each QuantLinear receives a fresh
+                                  functional_model instead of format-flag quantization.
+                                  mx_input_fmt and mx_output_fmt are forced to BFLOAT16
+                                  (QuantLinear requires this when functional_model is set).
+                                  Use pi0_inout.functional_models.get_functional_model_factory
+                                  to look up registered models (e.g. "ipt").
+        verbose:                  If True, print each replaced layer.
 
     Returns:
         The modified model (same object).
     """
+    use_functional = functional_model_factory is not None
+    # QuantLinear requires BF16 fmts when functional_model is set
+    _mx_in  = QuantFormat.BFLOAT16 if use_functional else mx_input_fmt
+    _mx_out = QuantFormat.BFLOAT16 if use_functional else mx_output_fmt
+
     if active_groups is None:
         skip_components: set[Component] = set()
     else:
@@ -203,14 +217,19 @@ def patch_model(
                 print(f"  SKIP  {name}  [{component.value}]")
             continue
 
+        # Build per-layer functional model if factory provided
+        fm = (functional_model_factory(module.in_features, module.out_features)
+              if use_functional else None)
+
         # Build the QuantLinear replacement
         quant_layer = QuantLinear(
             linear=module,
-            input_fmt=input_fmt,
-            output_fmt=output_fmt,
+            mx_input_fmt=_mx_in,
+            mx_output_fmt=_mx_out,
             component=component,
             layer_name=name,
             tracker=tracker,
+            functional_model=fm,
         )
 
         # Pre-register with tracker so summary() works even if some layers
@@ -234,10 +253,12 @@ def patch_model(
             )
 
     if verbose or True:  # always print summary
+        mode = (f"functional_model={functional_model_factory}"
+                if use_functional
+                else f"mx_input_fmt={mx_input_fmt.value}  mx_output_fmt={mx_output_fmt.value}")
         print(
             f"[patch_model] Replaced {n_replaced} nn.Linear layers "
-            f"(skipped {n_skipped}).  "
-            f"input_fmt={input_fmt.value}  output_fmt={output_fmt.value}"
+            f"(skipped {n_skipped}).  {mode}"
         )
 
     return model
@@ -350,8 +371,8 @@ _attn_component_local: threading.local = threading.local()
 def patch_attn_sdpa(
     model: nn.Module,
     active_groups: set[QuantGroup],
-    input_fmt: QuantFormat,
-    output_fmt: QuantFormat,
+    mx_input_fmt: QuantFormat,
+    mx_output_fmt: QuantFormat,
     tracker: Optional[StatsTracker] = None,
 ) -> list:
     """
@@ -369,11 +390,11 @@ def patch_attn_sdpa(
     all captured, even though their layers run inside a single joint forward.
 
     Args:
-        model:         The (already patch_model'd) Pi0Pytorch model.
-        active_groups: Groups whose SDPA calls should be quantized.
-        input_fmt:     Format for Q, K, V entering SDPA.
-        output_fmt:    Format for the attended output.
-        tracker:       Optional StatsTracker.
+        model:          The (already patch_model'd) Pi0Pytorch model.
+        active_groups:  Groups whose SDPA calls should be quantized.
+        mx_input_fmt:   Format for Q, K, V entering SDPA.
+        mx_output_fmt:  Format for the attended output.
+        tracker:        Optional StatsTracker.
 
     Returns:
         List of hook handles — pass to unpatch_attn_sdpa() to clean up.
@@ -414,11 +435,11 @@ def patch_attn_sdpa(
         if current_comp is None or current_comp not in active_comps:
             return _orig_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale)
 
-        q_q = quant(query.float(), input_fmt).to(query.dtype)
-        k_q = quant(key.float(),   input_fmt).to(key.dtype)
-        v_q = quant(value.float(), input_fmt).to(value.dtype)
+        q_q = quant(query.float(), mx_input_fmt).to(query.dtype)
+        k_q = quant(key.float(),   mx_input_fmt).to(key.dtype)
+        v_q = quant(value.float(), mx_input_fmt).to(value.dtype)
         out = _orig_sdpa(q_q, k_q, v_q, attn_mask, dropout_p, is_causal, scale=scale)
-        out_q = quant(out.float(), output_fmt).to(out.dtype)
+        out_q = quant(out.float(), mx_output_fmt).to(out.dtype)
 
         if tracker is not None:
             with torch.no_grad():
@@ -439,7 +460,7 @@ def patch_attn_sdpa(
     print(
         f"[patch_attn_sdpa] Hooked {n_modules} self_attn modules "
         f"for groups: {[g.value for g in active_groups]}  "
-        f"input_fmt={input_fmt.value}  output_fmt={output_fmt.value}"
+        f"mx_input_fmt={mx_input_fmt.value}  mx_output_fmt={mx_output_fmt.value}"
     )
     return handles
 
@@ -470,30 +491,30 @@ class QuantAttnContext:
 
     def __init__(
         self,
-        input_fmt: QuantFormat,
-        output_fmt: QuantFormat,
+        mx_input_fmt: QuantFormat,
+        mx_output_fmt: QuantFormat,
         tracker: Optional[StatsTracker] = None,
     ) -> None:
-        self.input_fmt   = input_fmt
-        self.output_fmt  = output_fmt
-        self.tracker     = tracker
-        self._call_count = 0
+        self.mx_input_fmt   = mx_input_fmt
+        self.mx_output_fmt  = mx_output_fmt
+        self.tracker        = tracker
+        self._call_count    = 0
 
     def __enter__(self) -> "QuantAttnContext":
-        input_fmt  = self.input_fmt
-        output_fmt = self.output_fmt
-        tracker    = self.tracker
-        ctx        = self
+        mx_input_fmt  = self.mx_input_fmt
+        mx_output_fmt = self.mx_output_fmt
+        tracker       = self.tracker
+        ctx           = self
 
         def _quant_sdpa(
             query, key, value,
             attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
         ):
-            q_q = quant(query.float(), input_fmt).to(query.dtype)
-            k_q = quant(key.float(),   input_fmt).to(key.dtype)
-            v_q = quant(value.float(), input_fmt).to(value.dtype)
+            q_q = quant(query.float(), mx_input_fmt).to(query.dtype)
+            k_q = quant(key.float(),   mx_input_fmt).to(key.dtype)
+            v_q = quant(value.float(), mx_input_fmt).to(value.dtype)
             out = _orig_sdpa(q_q, k_q, v_q, attn_mask, dropout_p, is_causal, scale=scale)
-            out_q = quant(out.float(), output_fmt).to(out.dtype)
+            out_q = quant(out.float(), mx_output_fmt).to(out.dtype)
 
             if tracker is not None:
                 with torch.no_grad():

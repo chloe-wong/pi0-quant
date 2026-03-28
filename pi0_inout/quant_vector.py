@@ -27,10 +27,10 @@ Usage
     from pi0_inout.quant_vector import patch_vector_ops, unpatch_vector_ops
 
     active = {QuantGroup.TRANSFORMER}
-    patch_model(model, input_fmt=FP8, output_fmt=FP16, active_groups=active)
+    patch_model(model, mx_input_fmt=FP8, mx_output_fmt=FP16, active_groups=active)
     attn_h = patch_attn_sdpa(model, active_groups=active, ...)
     vec_h, vec_ctx = patch_vector_ops(model, active_groups=active,
-                                      input_fmt=FP8, output_fmt=FP16)
+                                      vec_input_fmt=FP8, vec_output_fmt=FP16)
     with vec_ctx:
         actions = model.sample_actions(...)
 
@@ -62,6 +62,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from ._dispatch_guards import _in_quant_guard
 from .model_patcher import QuantGroup, _active_components, _infer_component
 from .quant_types import QuantFormat, quant
 from .stats_tracker import Component, StatsTracker
@@ -113,8 +114,7 @@ TARGET_OPS: frozenset = frozenset({
 #   exiting  vision_tower  → pop         (top = LANGUAGE again)
 _vec_component_stack: threading.local = threading.local()
 
-# Re-entrant guard: suppress dispatch interception inside quant() itself
-_in_quant_guard: threading.local = threading.local()
+# _in_quant_guard is imported from _dispatch_guards (shared with quant_linear)
 
 
 def _push_component(c: Component) -> None:
@@ -162,7 +162,7 @@ def _quant_output(out: object, fmt: QuantFormat) -> object:
 
 class VectorQuantMode(TorchDispatchMode):
     """
-    Context manager that quantizes every target vector op to (input_fmt, output_fmt).
+    Context manager that quantizes every target vector op to (vec_input_fmt, vec_output_fmt).
 
     Only ops executing within an active component (as signalled by the
     component-boundary hooks registered by patch_vector_ops) are quantized.
@@ -172,16 +172,16 @@ class VectorQuantMode(TorchDispatchMode):
     def __init__(
         self,
         active_groups: set[QuantGroup],
-        input_fmt: QuantFormat,
-        output_fmt: QuantFormat,
+        vec_input_fmt: QuantFormat,
+        vec_output_fmt: QuantFormat,
         tracker: Optional[StatsTracker] = None,
     ) -> None:
         super().__init__()
-        self.active_comps = _active_components(set(active_groups))
-        self.input_fmt  = input_fmt
-        self.output_fmt = output_fmt
-        self.tracker    = tracker
-        self._call_count = 0
+        self.active_comps  = _active_components(set(active_groups))
+        self.vec_input_fmt  = vec_input_fmt
+        self.vec_output_fmt = vec_output_fmt
+        self.tracker        = tracker
+        self._call_count    = 0
 
     def __torch_dispatch__(self, op, types, args=(), kwargs=None):
         if kwargs is None:
@@ -203,9 +203,9 @@ class VectorQuantMode(TorchDispatchMode):
         # Quantize inputs, run op, quantize output
         _in_quant_guard.active = True
         try:
-            q_args = _quant_args(args, self.input_fmt)
+            q_args = _quant_args(args, self.vec_input_fmt)
             out    = op(*q_args, **kwargs)
-            out_q  = _quant_output(out, self.output_fmt)
+            out_q  = _quant_output(out, self.vec_output_fmt)
 
             if self.tracker is not None:
                 with torch.no_grad():
@@ -230,8 +230,8 @@ class VectorQuantMode(TorchDispatchMode):
 def patch_vector_ops(
     model: torch.nn.Module,
     active_groups: set[QuantGroup],
-    input_fmt: QuantFormat,
-    output_fmt: QuantFormat,
+    vec_input_fmt: QuantFormat,
+    vec_output_fmt: QuantFormat,
     tracker: Optional[StatsTracker] = None,
 ) -> tuple[list, VectorQuantMode]:
     """
@@ -242,11 +242,11 @@ def patch_vector_ops(
     around inference and removing hooks afterwards via unpatch_vector_ops.
 
     Args:
-        model:         Pi0Pytorch model (or any nn.Module).
-        active_groups: Which QuantGroups to quantize.
-        input_fmt:     Format applied to tensor inputs of each vector op.
-        output_fmt:    Format applied to each vector op's output.
-        tracker:       Optional StatsTracker.
+        model:          Pi0Pytorch model (or any nn.Module).
+        active_groups:  Which QuantGroups to quantize.
+        vec_input_fmt:  Format applied to tensor inputs of each vector op.
+        vec_output_fmt: Format applied to each vector op's output.
+        tracker:        Optional StatsTracker.
 
     Returns:
         (handles, ctx) where handles is a list of hook handles and ctx is the
@@ -282,12 +282,12 @@ def patch_vector_ops(
         handles.append(mod.register_forward_hook(post_h))
         n_hooks += 1
 
-    ctx = VectorQuantMode(active_groups, input_fmt, output_fmt, tracker)
+    ctx = VectorQuantMode(active_groups, vec_input_fmt, vec_output_fmt, tracker)
 
     print(
         f"[patch_vector_ops] Hooked {n_hooks} component-boundary modules "
         f"for groups: {[g.value for g in active_groups]}  "
-        f"input_fmt={input_fmt.value}  output_fmt={output_fmt.value}"
+        f"vec_input_fmt={vec_input_fmt.value}  vec_output_fmt={vec_output_fmt.value}"
     )
     return handles, ctx
 
