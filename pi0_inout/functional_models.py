@@ -94,3 +94,15 @@ def _ipt_c_factory(in_features: int, out_features: int):
 
 
 register_functional_model("ipt_c", _ipt_c_factory)
+
+
+# ---------------------------------------------------------------------------
+# Built-in: Systolic Array C (C-compiled ctypes kernel)
+# ---------------------------------------------------------------------------
+
+def _systolic_c_factory(in_features: int, out_features: int):
+    from func_models_sa.systolic_c.systolic_array_rtl_linear import SARTLLinearFunction
+    return SARTLLinearFunction()
+
+
+register_functional_model("systolic_c", _systolic_c_factory)
