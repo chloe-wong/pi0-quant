@@ -26,7 +26,8 @@ Built-in models
 ---------------
   "ipt"       — IPTLinearRTLFunction: bit-accurate IPT simulation (pure Python).
   "ipt_numba" — same, with a parallel Numba JIT kernel (faster).
-  "ipt_c"     — same, with a C/ctypes kernel compiled at first import (fastest).
+  "ipt_c"          — same, with a C/ctypes kernel compiled at first import (fastest).
+  "ipt_c_parallel" — same as ipt_c, with OpenMP parallelism and per-layer logging.
 """
 
 from __future__ import annotations
@@ -94,6 +95,18 @@ def _ipt_c_factory(in_features: int, out_features: int):
 
 
 register_functional_model("ipt_c", _ipt_c_factory)
+
+
+# ---------------------------------------------------------------------------
+# Built-in: IPT C Parallel (C/OpenMP kernel with logging)
+# ---------------------------------------------------------------------------
+
+def _ipt_c_parallel_factory(in_features: int, out_features: int):
+    from funct_models_ipt.ipt_c_parallel.ipt_rtl_linear_c import CIPTLinearRTLFunction
+    return CIPTLinearRTLFunction()
+
+
+register_functional_model("ipt_c_parallel", _ipt_c_parallel_factory)
 
 
 # ---------------------------------------------------------------------------
