@@ -184,8 +184,8 @@ def _start_base_server(
         "--checkpoint-dir", checkpoint_dir,
         "--port",           str(port),
         "--gpu",            str(gpu),
-        "--input-fmt",      "bfloat16",
-        "--output-fmt",     "bfloat16",
+        "--mx-input-fmt",      "bfloat16",
+        "--mx-output-fmt",     "bfloat16",
     ]
     if openpi_dir:
         cmd += ["--openpi-dir", openpi_dir]
@@ -237,8 +237,8 @@ def _build_quant_server_template(
         "--checkpoint-dir", checkpoint_dir,
         "--port",           "{quantized_port}",
         "--gpu",            "0",   # with CUDA_VISIBLE_DEVICES={gpu}, only one GPU visible
-        "--input-fmt",      input_fmt,
-        "--output-fmt",     output_fmt,
+        "--mx-input-fmt",      input_fmt,
+        "--mx-output-fmt",     output_fmt,
         "--rel-err",        "{rel_err}",
     ]
     if openpi_dir:

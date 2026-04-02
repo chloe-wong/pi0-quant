@@ -271,10 +271,10 @@ def _start_quantized_server(
     _argv_set_kv(argv, "--port", str(quantized_port))
 
     # Auto-fill formats from defaults if not already in template.
-    if defaults.get("input_fmt") and not _argv_has(argv, "--input-fmt"):
-        _argv_set_kv(argv, "--input-fmt", str(defaults["input_fmt"]))
-    if defaults.get("output_fmt") and not _argv_has(argv, "--output-fmt"):
-        _argv_set_kv(argv, "--output-fmt", str(defaults["output_fmt"]))
+    if defaults.get("input_fmt") and not _argv_has(argv, "--mx-input-fmt"):
+        _argv_set_kv(argv, "--mx-input-fmt", str(defaults["input_fmt"]))
+    if defaults.get("output_fmt") and not _argv_has(argv, "--mx-output-fmt"):
+        _argv_set_kv(argv, "--mx-output-fmt", str(defaults["output_fmt"]))
 
     return subprocess.Popen(
         argv,
