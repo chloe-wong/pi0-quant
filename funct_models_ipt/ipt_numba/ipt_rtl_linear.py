@@ -84,7 +84,7 @@ def e4m3_bytes_to_float(x: torch.Tensor) -> torch.Tensor:
 
 
 def decode_model_output_bits(out_bits: torch.Tensor, out_fmt_sel: OutputFmtSel) -> torch.Tensor:
-    if out_fmt_sel is OutputFmtSel.OutBF16:
+    if getattr(out_fmt_sel, 'value', out_fmt_sel) == 0:
         return torch_bf16_bits_to_float(out_bits.to(torch.int32))
     e4m3_bytes = (out_bits & 0xFF).to(torch.uint8)
     return e4m3_bytes_to_float(e4m3_bytes)

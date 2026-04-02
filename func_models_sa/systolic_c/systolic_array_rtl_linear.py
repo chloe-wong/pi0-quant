@@ -175,7 +175,7 @@ class SARTLLinearFunction:
     def __init__(
         self,
         rows: int = 32,
-        cols: int = 16,
+        cols: int = 32,
         out_fmt_sel: OutputFmtSel = OutputFmtSel.OutBF16,
     ) -> None:
         self.rows = rows
