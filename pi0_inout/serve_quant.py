@@ -101,6 +101,7 @@ _KNOWN_CONFIGS: dict[str, SimpleNamespace] = {
         action_dim=32,
         action_horizon=15,
         max_token_len=200,
+        pytorch_compile_mode="max-autotune",
     ),
     # pi05 droid (non-Polaris)
     "pi05_droid": SimpleNamespace(
@@ -111,6 +112,7 @@ _KNOWN_CONFIGS: dict[str, SimpleNamespace] = {
         action_dim=32,
         action_horizon=15,
         max_token_len=200,
+        pytorch_compile_mode="max-autotune",
     ),
     # pi0 droid joint-position Polaris (non-pi05)
     "pi0_droid_jointpos_polaris": SimpleNamespace(
@@ -121,6 +123,7 @@ _KNOWN_CONFIGS: dict[str, SimpleNamespace] = {
         action_dim=32,
         action_horizon=10,
         max_token_len=100,
+        pytorch_compile_mode="max-autotune",
     ),
     # pi0 droid joint-position (non-pi05)
     "pi0_droid": SimpleNamespace(
@@ -131,6 +134,7 @@ _KNOWN_CONFIGS: dict[str, SimpleNamespace] = {
         action_dim=32,
         action_horizon=50,
         max_token_len=48,
+        pytorch_compile_mode="max-autotune",
     ),
     # aloha sim (non-pi05)
     "pi0_aloha_sim": SimpleNamespace(
@@ -141,6 +145,7 @@ _KNOWN_CONFIGS: dict[str, SimpleNamespace] = {
         action_dim=32,
         action_horizon=50,
         max_token_len=48,
+        pytorch_compile_mode="max-autotune",
     ),
 }
 
@@ -185,7 +190,7 @@ def load_pi0_pytorch(
     model = PI0Pytorch(cfg)
     # torch.compile is applied in __init__; QuantLinear has Python-level conditional
     # logic that Dynamo cannot trace. Unwrap back to the raw Python method.
-    model.sample_actions = model.sample_actions.__wrapped__
+
     model = model.to(device)
     model.eval()
 
