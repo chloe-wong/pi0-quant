@@ -7,7 +7,7 @@ import torch
 
 from .fp_formats import AddendSel, OutputFmtSel
 from .params_and_requests import InnerProductTreeParams
-from ._numba_kernels import compute_lanes_batch, MUL_LUT
+from ._numba_kernels import compute_lanes_batch_n, MUL_LUT
 
 log = logging.getLogger(__name__)
 
@@ -108,16 +108,20 @@ class IPTLinearRTLFunction:
         num_lanes: int = 32,
         pipeline_depth: int = 1,
         out_fmt_sel: OutputFmtSel = OutputFmtSel.OutBF16,
+        extra_bits: int = 17,
     ):
         self.p = InnerProductTreeParams.withPipelineDepth(
             pipeline_depth,
-            InnerProductTreeParams(numLanes=num_lanes, vecLen=vec_len),
+            InnerProductTreeParams(numLanes=num_lanes, vecLen=vec_len,
+                                   extraBits=extra_bits),
         )
         self.out_fmt_sel = out_fmt_sel
         self._prepared_cache = None
         log.info(
-            "IPTLinearRTLFunction init: vec_len=%d  num_lanes=%d  pipeline_depth=%d  out_fmt=%s",
+            "IPTLinearRTLFunction init: vec_len=%d  num_lanes=%d  pipeline_depth=%d  "
+            "out_fmt=%s  extra_bits=%d  intWidth=%d",
             vec_len, num_lanes, pipeline_depth, out_fmt_sel.name,
+            extra_bits, self.p.intWidth,
         )
 
     def _tensor_cache_key(self, t: Optional[torch.Tensor]):
@@ -279,7 +283,7 @@ class IPTLinearRTLFunction:
                 )
 
                 wbuf = k_wbufs[k_tile]
-                psum_np = compute_lanes_batch(
+                psum_np = compute_lanes_batch_n(
                     acts_tiles[k_tile],
                     wbuf, wbuf,                       # buf_read_sel=False → wbuf0 used
                     cur_bias,
@@ -289,6 +293,7 @@ class IPTLinearRTLFunction:
                     addend_sel,
                     np.int32(self.out_fmt_sel.value),
                     MUL_LUT,
+                    np.int64(self.p.intWidth),
                 )
 
             tile_bits = torch.from_numpy(psum_np[:, :lane_count]).to(device=device)

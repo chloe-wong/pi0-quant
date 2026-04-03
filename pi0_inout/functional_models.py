@@ -85,6 +85,18 @@ register_functional_model("ipt_numba", _ipt_numba_factory)
 
 
 # ---------------------------------------------------------------------------
+# Built-in: IPT Numba Exp (runtime-parametric int_width, for extraBits sweeps)
+# ---------------------------------------------------------------------------
+
+def _ipt_numba_exp_factory(in_features: int, out_features: int):
+    from funct_models_ipt.ipt_numba_exp.ipt_rtl_linear import IPTLinearRTLFunction
+    return IPTLinearRTLFunction()
+
+
+register_functional_model("ipt_numba_exp", _ipt_numba_exp_factory)
+
+
+# ---------------------------------------------------------------------------
 # Built-in: IPT C (C-compiled ctypes kernel, fastest)
 # ---------------------------------------------------------------------------
 
