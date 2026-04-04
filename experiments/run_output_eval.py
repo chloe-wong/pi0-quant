@@ -49,11 +49,10 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 
+import numpy as np
 import torch
-import torch.nn as nn
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
@@ -71,6 +70,7 @@ from pi0_inout import (
     set_fp8_mode,
 )
 from pi0_inout.eval_harness import _compute_action_rmse
+from pi0_inout.serve_quant import _load_norm_stats, Pi0PyTorchPolicy
 
 PASSTHROUGH = "passthrough"
 
@@ -85,26 +85,15 @@ def _fmt_or_passthrough(s: str) -> Optional[QuantFormat]:
     return QuantFormat(s)
 
 
-def _make_dummy_obs(config_ns: SimpleNamespace, device: torch.device) -> SimpleNamespace:
-    H, W = 224, 224
-    max_tok = config_ns.max_token_len
-    return SimpleNamespace(
-        images={
-            "base_0_rgb":        torch.randn(1, 3, H, W, dtype=torch.float32, device=device),
-            "left_wrist_0_rgb":  torch.randn(1, 3, H, W, dtype=torch.float32, device=device),
-            "right_wrist_0_rgb": torch.zeros(1, 3, H, W, dtype=torch.float32, device=device),
-        },
-        image_masks={
-            "base_0_rgb":        torch.ones(1,  dtype=torch.bool, device=device),
-            "left_wrist_0_rgb":  torch.ones(1,  dtype=torch.bool, device=device),
-            "right_wrist_0_rgb": torch.zeros(1, dtype=torch.bool, device=device),
-        },
-        state=torch.randn(1, 32, dtype=torch.float32, device=device),
-        tokenized_prompt=      torch.zeros(1, max_tok, dtype=torch.int64, device=device),
-        tokenized_prompt_mask= torch.ones(1,  max_tok, dtype=torch.bool,  device=device),
-        token_ar_mask=         torch.zeros(1, max_tok, dtype=torch.bool,  device=device),
-        token_loss_mask=       torch.zeros(1, max_tok, dtype=torch.bool,  device=device),
-    )
+def _make_dummy_obs(rng: np.random.Generator) -> dict:
+    """Random observation dict compatible with Pi0PyTorchPolicy.infer()."""
+    return {
+        "observation/exterior_image_1_left": rng.integers(0, 255, (224, 224, 3), dtype=np.uint8),
+        "observation/wrist_image_left":      rng.integers(0, 255, (224, 224, 3), dtype=np.uint8),
+        "observation/joint_position":        rng.random(7).astype(np.float32),
+        "observation/gripper_position":      rng.random(1).astype(np.float32),
+        "prompt": "Grab the object",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -138,25 +127,24 @@ def _start_heartbeat(
 # ---------------------------------------------------------------------------
 
 def _collect_actions(
-    model: nn.Module,
+    policy: Pi0PyTorchPolicy,
     observations: list,
-    device: torch.device,
     num_steps: int,
     label: str,
     t0: float,
 ) -> list[torch.Tensor]:
-    """Run model on all observations; return list of CPU action tensors."""
+    """Run policy on all observations; return list of CPU action tensors."""
     actions = []
     n = len(observations)
     stop = threading.Event()
     _start_heartbeat(label, t0, stop)
-    with torch.no_grad():
-        for i, obs in enumerate(observations):
-            print(f"\n[{label}] obs {i+1}/{n} ({num_steps} diffusion steps)...", flush=True)
-            obs_t0 = time.monotonic()
-            act = model.sample_actions(str(device), obs, num_steps=num_steps)
-            print(f"[{label}] obs {i+1}/{n} done in {time.monotonic()-obs_t0:.1f}s", flush=True)
-            actions.append(act.detach().cpu())
+    for i, obs in enumerate(observations):
+        print(f"\n[{label}] obs {i+1}/{n} ({num_steps} diffusion steps)...", flush=True)
+        obs_t0 = time.monotonic()
+        result = policy.infer(obs)
+        act = torch.from_numpy(result["actions"])
+        print(f"[{label}] obs {i+1}/{n} done in {time.monotonic()-obs_t0:.1f}s", flush=True)
+        actions.append(act)
     stop.set()
     return actions
 
@@ -166,9 +154,8 @@ def _collect_actions(
 # ---------------------------------------------------------------------------
 
 def run(
-    model: nn.Module,
+    policy: Pi0PyTorchPolicy,
     observations: list,
-    device: torch.device,
     active_groups: set[QuantGroup],
     mx_input_fmt: Optional[QuantFormat],
     mx_output_fmt: Optional[QuantFormat],
@@ -182,9 +169,11 @@ def run(
     Collect baseline actions (unpatched) then quantized actions (patched).
     Returns (baseline_actions, quant_actions) — both lists of CPU tensors.
     """
+    model = policy.model
+
     # --- Baseline pass -------------------------------------------------------
     print("\n=== Baseline (unpatched) pass ===")
-    baseline_actions = _collect_actions(model, observations, device, num_steps, "baseline", t0)
+    baseline_actions = _collect_actions(policy, observations, num_steps, "baseline", t0)
 
     # --- Resolve effective formats -------------------------------------------
     _mx_in  = mx_input_fmt  or QuantFormat.BFLOAT16
@@ -218,7 +207,7 @@ def run(
         active_groups=active_groups,
         vec_input_fmt=_vi,
         vec_output_fmt=_vo,
-        tracker=StatsTracker(),  # we don't use vec per-layer stats here
+        tracker=StatsTracker(),
     )
 
     # --- Quantized pass ------------------------------------------------------
@@ -227,13 +216,14 @@ def run(
     n = len(observations)
     stop = threading.Event()
     _start_heartbeat("quantized", t0, stop, mx_tracker=mx_tracker)
-    with torch.no_grad(), vec_ctx:
+    with vec_ctx:
         for i, obs in enumerate(observations):
             print(f"\n[quantized] obs {i+1}/{n} ({num_steps} diffusion steps)...", flush=True)
             obs_t0 = time.monotonic()
-            act = model.sample_actions(str(device), obs, num_steps=num_steps)
+            result = policy.infer(obs)
+            act = torch.from_numpy(result["actions"])
             print(f"[quantized] obs {i+1}/{n} done in {time.monotonic()-obs_t0:.1f}s", flush=True)
-            quant_actions.append(act.detach().cpu())
+            quant_actions.append(act)
     stop.set()
 
     # --- Unpatch -------------------------------------------------------------
@@ -382,16 +372,14 @@ def main() -> None:
                         default=str(_REPO / "experiments" / "results"))
     parser.add_argument("--fp8-mode", default="po2", choices=["po2", "abs"])
     parser.add_argument("--norm-stats-dir", metavar="DIR", default=None,
-                        help="Directory containing normalization statistics")
+                        help="Directory containing norm_stats.json "
+                             "(default: tries <checkpoint-dir>/assets/droid/)")
+    parser.add_argument("--tokenizer-path", default=None,
+                        help="Path to paligemma_tokenizer.model "
+                             "(default: searches ~/Desktop and ~/.cache/openpi/)")
+    parser.add_argument("--use-quantile-norm", action="store_true")
 
     args = parser.parse_args()
-
-    if args.norm_stats_dir is None:
-        print(
-            "WARNING: --norm-stats-dir was not provided. "
-            "Norm stats must be provided for accurate quantization evaluation.",
-            file=sys.stderr,
-        )
 
     # ── Validate ─────────────────────────────────────────────────────────────
     if args.functional_model is not None and args.mx_output_fmt != PASSTHROUGH:
@@ -422,8 +410,27 @@ def main() -> None:
     model = load_pi0_pytorch(args.config, args.checkpoint_dir, device)
     model.eval()
 
-    torch.manual_seed(0)
-    observations = [_make_dummy_obs(config_ns, device) for _ in range(args.n_obs)]
+    # ── Norm stats ────────────────────────────────────────────────────────────
+    norm_stats = None
+    if args.norm_stats_dir:
+        norm_stats = _load_norm_stats(args.norm_stats_dir)
+        print(f"Loaded norm stats from {args.norm_stats_dir}  (keys: {list(norm_stats.keys())})")
+    else:
+        print("WARNING: no norm stats found — actions will be in normalized space.", file=sys.stderr)
+
+    is_joint_position = "jointpos" in args.config
+    policy = Pi0PyTorchPolicy(
+        model=model,
+        device=device,
+        norm_stats=norm_stats,
+        use_quantile_norm=args.use_quantile_norm,
+        is_joint_position=is_joint_position,
+        max_token_len=config_ns.max_token_len,
+        tokenizer_path=args.tokenizer_path,
+    )
+
+    rng = np.random.default_rng(0)
+    observations = [_make_dummy_obs(rng) for _ in range(args.n_obs)]
     print(f"Observations: {args.n_obs}  steps: {args.steps}")
 
     # ── Config record ─────────────────────────────────────────────────────────
@@ -451,9 +458,8 @@ def main() -> None:
     print(f"\nRunning config: {args.label}")
     t0 = time.monotonic()
     baseline_actions, quant_actions = run(
-        model=model,
+        policy=policy,
         observations=observations,
-        device=device,
         active_groups=active_groups,
         mx_input_fmt=mx_input_fmt,
         mx_output_fmt=mx_output_fmt,
