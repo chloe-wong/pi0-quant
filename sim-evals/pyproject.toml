@@ -1,0 +1,55 @@
+[project]
+name = "sim-evals"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pip>=25.0",
+  "mediapy>=1.2.4",
+  "openpi-client",
+  "isaaclab[all,isaacsim]==2.2.0",
+  "tyro>=0.9.17",
+  "websockets>=16.0",
+  "opencv-python>=4.11.0.86",
+]
+
+[tool.uv]
+override-dependencies = [
+  "websockets>=16.0"
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = {index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'"}
+isaacsim = { index = "isaac" }
+real2simeval = { workspace = true }
+openpi-client = { git = "https://github.com/Physical-Intelligence/openpi.git", subdirectory = "packages/openpi-client" }
+
+[[tool.uv.index]]
+name = "isaac"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.basedpyright]
+extraPaths = [
+    "./submodules/IsaacLab/source/isaaclab",
+    "./submodules/IsaacLab/source/isaaclab_assets",
+    "./submodules/IsaacLab/source/isaaclab_tasks"
+]
+typeCheckingMode = "standard"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.extra-build-dependencies]
+flatdict = ["setuptools<82"]
