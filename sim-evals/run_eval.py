@@ -78,11 +78,9 @@ def main(
 
     obs, _ = env.reset()
     obs, _ = env.reset() # need second render cycle to get correctly loaded materials
-    client = DroidJointPosClient(obs_save_dir=save_obs_dir, obs_save_txt=save_obs_txt, remote_host=remote_host, remote_port=remote_port)
-
-
     video_dir = Path("runs") / datetime.now().strftime("%Y-%m-%d") / datetime.now().strftime("%H-%M-%S")
     video_dir.mkdir(parents=True, exist_ok=True)
+    client = DroidJointPosClient(obs_save_dir=save_obs_dir or str(video_dir), obs_save_txt=save_obs_txt, remote_host=remote_host, remote_port=remote_port)
     video = []
     ep = 0
     max_steps = env.env.max_episode_length
