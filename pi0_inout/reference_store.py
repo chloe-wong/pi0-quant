@@ -57,7 +57,7 @@ class ReferenceStore:
                     if isinstance(out, torch.Tensor):
                         if n not in self._outputs:
                             self._outputs[n] = []
-                        self._outputs[n].append(out.detach().cpu())
+                        self._outputs[n].append(out.detach().clone())
                 return _hook
 
             handles.append(module.register_forward_hook(_make_hook(name)))
@@ -85,7 +85,7 @@ class ReferenceStore:
         """
         if name not in self._outputs:
             self._outputs[name] = []
-        self._outputs[name].append(tensor.detach().cpu())
+        self._outputs[name].append(tensor.detach().clone())
 
     def reset_counters(self) -> None:
         """Reset per-layer call indices. Call before each patched forward pass."""
