@@ -380,7 +380,7 @@ def print_quant_diagnostics(
     if sample_layer is not None:
         name, layer = sample_layer
         w = layer.weight.detach().float()
-        target_dtype = TORCH_DTYPE[input_fmt]
+        target_dtype = TORCH_DTYPE[mx_input_fmt]
         w_quant = w.to(target_dtype).to(w.dtype)
         diff = (w - w_quant).abs()
         n_changed = (diff > 0).sum().item()

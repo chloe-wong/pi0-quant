@@ -35,6 +35,10 @@ def main(
         episodes:int = 10,
         headless: bool = True,
         scene: int = 1,
+        save_obs_dir: str | None = None,
+        save_obs_txt: bool = False,
+        remote_host: str = "localhost",
+        remote_port: int = 8000,
         ):
     # launch omniverse app with arguments (inside function to prevent overriding tyro)
     from isaaclab.app import AppLauncher
@@ -74,7 +78,7 @@ def main(
 
     obs, _ = env.reset()
     obs, _ = env.reset() # need second render cycle to get correctly loaded materials
-    client = DroidJointPosClient()
+    client = DroidJointPosClient(obs_save_dir=save_obs_dir, obs_save_txt=save_obs_txt, remote_host=remote_host, remote_port=remote_port)
 
 
     video_dir = Path("runs") / datetime.now().strftime("%Y-%m-%d") / datetime.now().strftime("%H-%M-%S")

@@ -1,15 +1,18 @@
 import tyro
 import numpy as np
+from pathlib import Path
 from PIL import Image
 from openpi_client import websocket_client_policy, image_tools
 
 from .abstract_client import InferenceClient
 
 class Client(InferenceClient):
-    def __init__(self, 
-                remote_host:str = "localhost", 
+    def __init__(self,
+                remote_host:str = "localhost",
                 remote_port:int = 8000,
                 open_loop_horizon:int = 8,
+                obs_save_dir: str | None = None,
+                obs_save_txt: bool = False,
                  ) -> None:
         self.open_loop_horizon = open_loop_horizon
         self.client = websocket_client_policy.WebsocketClientPolicy(
@@ -18,6 +21,12 @@ class Client(InferenceClient):
 
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
+
+        self.obs_save_dir = Path(obs_save_dir) if obs_save_dir is not None else None
+        self.obs_save_txt = obs_save_txt
+        self._obs_count = 0
+        if self.obs_save_dir is not None:
+            self.obs_save_dir.mkdir(parents=True, exist_ok=True)
 
     def visualize(self, request: dict):
         """
@@ -43,6 +52,25 @@ class Client(InferenceClient):
             or self.actions_from_chunk_completed >= self.open_loop_horizon
         ):
             self.actions_from_chunk_completed = 0
+            if self.obs_save_dir is not None:
+                n = self._obs_count
+                base = self.obs_save_dir / f"obs_{n:04d}"
+                np.savez(
+                    str(base) + ".npz",
+                    right_image=curr_obs["right_image"],
+                    wrist_image=curr_obs["wrist_image"],
+                    joint_position=curr_obs["joint_position"],
+                    gripper_position=curr_obs["gripper_position"],
+                    prompt=np.bytes_(instruction),
+                )
+                if self.obs_save_txt:
+                    Image.fromarray(curr_obs["right_image"]).save(str(base) + "_right.png")
+                    Image.fromarray(curr_obs["wrist_image"]).save(str(base) + "_wrist.png")
+                    with open(str(base) + "_info.txt", "w") as f:
+                        f.write(f"prompt: {instruction}\n")
+                        f.write(f"joint_position: {curr_obs['joint_position'].tolist()}\n")
+                        f.write(f"gripper_position: {curr_obs['gripper_position'].tolist()}\n")
+                self._obs_count += 1
             request_data = {
                 "observation/exterior_image_1_left": image_tools.resize_with_pad(
                     curr_obs["right_image"], 224, 224
