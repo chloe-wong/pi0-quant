@@ -137,20 +137,31 @@ def _load_real_obs(
     config_ns: SimpleNamespace,
     checkpoint_dir: str,
     device: torch.device,
+    obs_file: str | None = None,
+    norm_stats_dir: str | None = None,
 ) -> list[SimpleNamespace]:
     from pi0_inout.serve_quant import _load_norm_stats
 
     obs_dir = Path(obs_dir)
-    npz_files = sorted(obs_dir.glob("obs_*.npz"))
+    if obs_file is not None:
+        npz_path = Path(obs_file)
+        if not npz_path.is_absolute():
+            npz_path = obs_dir / npz_path
+        if not npz_path.exists():
+            raise FileNotFoundError(f"obs file not found: {npz_path}")
+        npz_files = [npz_path]
+    else:
+        npz_files = sorted(obs_dir.glob("obs_*.npz"))
     if not npz_files:
         raise FileNotFoundError(f"No obs_*.npz files found in {obs_dir}")
 
     # Load norm stats
     norm_stats = None
+    _norm_dir = norm_stats_dir if norm_stats_dir is not None else checkpoint_dir
     try:
-        norm_stats = _load_norm_stats(checkpoint_dir)
+        norm_stats = _load_norm_stats(_norm_dir)
     except FileNotFoundError:
-        print(f"[warn] norm_stats.json not found in {checkpoint_dir}; skipping normalization")
+        print(f"[warn] norm_stats.json not found in {_norm_dir}; skipping normalization")
 
     # Load tokenizer (same search path as Pi0PyTorchPolicy)
     tokenizer_path = None
@@ -174,11 +185,18 @@ def _load_real_obs(
     for npz_path in npz_files:
         data = np.load(npz_path, allow_pickle=False)
 
-        # Images: uint8 HWC (H,W,3) → float32 CHW (1,3,H,W) in [-1, 1]
+        # Images: uint8 HWC (H,W,3) → float32 CHW (1,3,224,224) in [-1, 1]
+        # Pre-resize to 224x224 here (matching the sim-evals WebSocket path which resizes
+        # before sending) to avoid a batch-squeeze bug in resize_with_pad_torch.
         def _img(arr):
             t = torch.from_numpy(arr.copy()).to(device)
-            t = t.permute(2, 0, 1).unsqueeze(0).float()
-            return t / 255.0 * 2.0 - 1.0
+            t = t.permute(2, 0, 1).unsqueeze(0).float()  # [1, 3, H, W]
+            t = t / 255.0 * 2.0 - 1.0
+            if t.shape[2:] != (224, 224):
+                t = torch.nn.functional.interpolate(
+                    t, size=(224, 224), mode="bilinear", align_corners=False
+                )
+            return t
 
         base_img  = _img(data["right_image"])
         wrist_img = _img(data["wrist_image"])
@@ -648,6 +666,13 @@ def main() -> None:
     parser.add_argument("--obs-dir", metavar="DIR", default=None,
                         help="Directory of obs_*.npz files saved from sim-evals. "
                              "When set, uses real observations instead of random dummies.")
+    parser.add_argument("--obs-file", metavar="FILE", default=None,
+                        help="Single obs_*.npz file to load (bare filename or full path). "
+                             "Requires --obs-dir for norm_stats lookup. "
+                             "When set, overrides globbing all files in --obs-dir.")
+    parser.add_argument("--norm-stats-dir", metavar="DIR", default=None,
+                        help="Directory containing norm_stats.json. "
+                             "Defaults to --checkpoint-dir if not set.")
     parser.add_argument("--steps",  type=int, default=10,
                         help="Diffusion steps per sample_actions call")
 
@@ -730,9 +755,14 @@ def main() -> None:
 
     torch.manual_seed(0)
     if args.obs_dir is not None:
-        observations = _load_real_obs(args.obs_dir, config_ns, args.checkpoint_dir, device)
+        observations = _load_real_obs(args.obs_dir, config_ns, args.checkpoint_dir, device,
+                                      obs_file=args.obs_file,
+                                      norm_stats_dir=args.norm_stats_dir)
+        src = args.obs_file if args.obs_file else f"all obs_*.npz in {args.obs_dir}"
+        print(f"[obs] real observations from: {src}")
     else:
         observations = [_make_dummy_obs(config_ns, device) for _ in range(args.n_obs)]
+        print(f"[obs] using {len(observations)} dummy (random) observations")
     print(f"Observations: {len(observations)}  steps: {args.steps}")
 
     # ── Build config record ──────────────────────────────────────────────────
