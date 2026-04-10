@@ -95,7 +95,7 @@ from pi0_inout import (
 )
 from pi0_inout.model_patcher import OpScope, ALL_SCOPES, patch_conv2d, unpatch_conv2d
 from pi0_inout.reference_store import ReferenceStore
-from pi0_inout.matmul_io_store import MatmulIOStore
+from pi0_inout.matmul_io_store import MatmulIOStore, _to_bf16_numpy
 
 PASSTHROUGH = "passthrough"
 
@@ -530,6 +530,26 @@ def run(
     }
     ref_hooks = ref_store.register_hooks(model, layer_names)
 
+    # SANITY CHECKING FOR INT16->BF16 REINTERPRETATION
+    # ── Real BF16 I/O capture for target layer (independent of MatmulIOStore) ──
+    _TARGET_LAYER = (
+        "paligemma_with_expert.paligemma.model.vision_tower"
+        ".vision_model.encoder.layers.0.mlp.fc1"
+    )
+    _real_unpatched_x: list = []
+    _real_unpatched_y: list = []
+    _real_patched_x:   list = []
+    _real_patched_y:   list = []
+    _real_io_handles:  list = []
+
+    if matmul_io_store is not None:
+        _tgt = dict(model.named_modules()).get(_TARGET_LAYER)
+        if _tgt is not None:
+            def _unpatched_hook(module, inp, out):
+                _real_unpatched_x.append(_to_bf16_numpy(inp[0]))
+                _real_unpatched_y.append(_to_bf16_numpy(out))
+            _real_io_handles.append(_tgt.register_forward_hook(_unpatched_hook))
+
     # ── Capture unpatched matmul I/O tensors and clean inputs during reference pass ──
     ref_input_store = ReferenceStore()
     io_hooks: list = []
@@ -590,6 +610,11 @@ def run(
 
     print(f"[reference_store] Captured {len(ref_store)} reference layer outputs.")
 
+    # Remove unpatched hook before patch_model replaces the module
+    for h in _real_io_handles:
+        h.remove()
+    _real_io_handles.clear()
+
     patch_model(
         model,
         mx_input_fmt=_mx_in,
@@ -641,6 +666,15 @@ def run(
         tracker=vec_tracker,
     )
 
+    # Register patched hook on the (now QuantLinear) target layer
+    if matmul_io_store is not None:
+        _tgt = dict(model.named_modules()).get(_TARGET_LAYER)
+        if _tgt is not None:
+            def _patched_hook(module, inp, out):
+                _real_patched_x.append(_to_bf16_numpy(inp[0]))
+                _real_patched_y.append(_to_bf16_numpy(out))
+            _real_io_handles.append(_tgt.register_forward_hook(_patched_hook))
+
     n_obs = len(observations)
     stop_heartbeat = threading.Event()
     _start_heartbeat(mx_tracker, vec_tracker, t0, stop_heartbeat)
@@ -663,6 +697,8 @@ def run(
             )
 
     stop_heartbeat.set()
+    for h in _real_io_handles:
+        h.remove()
     unpatch_model(model)
     if OpScope.CONV2D in op_scopes:
         unpatch_conv2d(model)
@@ -672,6 +708,27 @@ def run(
 
     if matmul_io_store is not None:
         matmul_io_store.save()
+
+    if matmul_io_store is not None and (_real_unpatched_x or _real_patched_x):
+        arrays: dict = {"n_calls": np.array(
+            max(len(_real_unpatched_x), len(_real_patched_x)), dtype=np.int64
+        )}
+        for key, frames in [
+            ("unpatched_x", _real_unpatched_x),
+            ("unpatched_y", _real_unpatched_y),
+            ("patched_x",   _real_patched_x),
+            ("patched_y",   _real_patched_y),
+        ]:
+            if not frames:
+                continue
+            try:
+                arrays[key] = np.stack(frames, axis=0)
+            except ValueError:
+                for i, arr in enumerate(frames):
+                    arrays[f"{key}_call{i}"] = arr
+        fname = _TARGET_LAYER.replace(".", "__") + "_real_io.npz"
+        np.savez(matmul_io_store.save_dir / fname, **arrays)
+        print(f"[real IO] Saved {fname}")
 
     return mx_tracker, vec_tracker
 
