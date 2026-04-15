@@ -82,7 +82,6 @@ from pi0_inout.model_patcher import (
     patch_attn_sdpa, unpatch_attn_sdpa,
 )
 from pi0_inout.quant_linear import QuantLinear
-from pi0_inout.rel_noise import NoiseMode
 from pi0_inout.stats_tracker import StatsTracker
 
 
@@ -644,8 +643,6 @@ def main() -> None:
 
     active_groups = {QuantGroup(g) for g in args.quantize_components}
 
-    noise_mode = NoiseMode(args.noise_mode)
-
     tracker = StatsTracker()
     patch_model(
         model=model,
@@ -654,7 +651,6 @@ def main() -> None:
         tracker=tracker,
         active_groups=active_groups,
         noise_injection=args.rel_err,
-        noise_mode=noise_mode,
         verbose=False,
     )
     attn_handles = patch_attn_sdpa(
@@ -666,8 +662,7 @@ def main() -> None:
     )
     logger.info(
         f"Model patched: mx_input_fmt={mx_input_fmt.value}  mx_output_fmt={mx_output_fmt.value}  "
-        f"rel_err={args.rel_err}  noise_mode={noise_mode.value}  "
-        f"components={args.quantize_components}"
+        f"rel_err={args.rel_err}  components={args.quantize_components}"
     )
 
     # ── Print quantization diagnostics ────────────────────────────────────
@@ -727,7 +722,6 @@ def main() -> None:
         "mx_input_fmt": mx_input_fmt.value,
         "mx_output_fmt": mx_output_fmt.value,
         "rel_err": args.rel_err,
-        "noise_mode": noise_mode.value,
     }
 
     from openpi.serving import websocket_policy_server
@@ -800,13 +794,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rel-err", type=float, default=0.0,
                    help="Relative-error noise fraction injected into each matmul output "
                         "(e.g. 0.01 = 1%%). 0 = disabled.")
-    p.add_argument("--noise-mode", default="uniform",
-                   choices=[m.value for m in NoiseMode],
-                   help="Noise distribution: "
-                        "'uniform' = ±rel_err * |y| with random sign (two-point / Rademacher), "
-                        "'laplace' = Laplace(0, rel_err) * |y| (better fit for FP8 quant error — "
-                        "empirically heavy-tailed with excess kurtosis ~3-60, see "
-                        "experiments/test_error_distribution.py)")
 
     # Output
     p.add_argument("--stats-output", default=None,

@@ -30,7 +30,7 @@ Quick start:
 
 from .quant_types   import QuantFormat, quant, TORCH_DTYPE, FORMAT_BITS, all_formats, sweep_pairs, set_fp8_mode, get_fp8_mode
 from .quant_linear  import QuantLinear
-from .rel_noise     import RelNoiseConfig, NoiseMode, inject_rel_noise
+from .rel_noise     import RelNoiseConfig, inject_rel_noise
 from .model_patcher import (
     patch_model, unpatch_model, count_layers, list_linear_layers,
     QuantAttnContext,
@@ -73,7 +73,6 @@ __all__ = [
     "QuantLinear",
     # Noise injection
     "RelNoiseConfig",
-    "NoiseMode",
     "inject_rel_noise",
     # Patching
     "patch_model",

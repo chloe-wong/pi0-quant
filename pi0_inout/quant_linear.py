@@ -36,7 +36,7 @@ from typing import Optional
 from ._dispatch_guards import _in_quant_guard
 from .quant_types import QuantFormat, quant
 from .stats_tracker import StatsTracker, Component
-from .rel_noise import inject_rel_noise, NoiseMode
+from .rel_noise import inject_rel_noise
 
 
 class QuantLinear(nn.Module):
@@ -65,7 +65,6 @@ class QuantLinear(nn.Module):
         layer_name: str = "",
         tracker: Optional[StatsTracker] = None,
         noise_injection: float = 0.0,
-        noise_mode: NoiseMode = NoiseMode.UNIFORM,
         functional_model=None,
         reference_store=None,
     ) -> None:
@@ -87,7 +86,6 @@ class QuantLinear(nn.Module):
         self.mx_input_fmt    = mx_input_fmt
         self.mx_output_fmt   = mx_output_fmt
         self.noise_injection = noise_injection
-        self.noise_mode      = noise_mode
         self.functional_model = functional_model
         self.component       = component
         self.layer_name      = layer_name
@@ -122,7 +120,7 @@ class QuantLinear(nn.Module):
 
             # ── Noise injection ───────────────────────────────────────────────
             if self.noise_injection != 0.0:
-                y_accum = inject_rel_noise(y_accum, rel_err=self.noise_injection, mode=self.noise_mode)
+                y_accum = inject_rel_noise(y_accum, rel_err=self.noise_injection)
 
             # ── Quantize output, cast back to original dtype ──────────────────
             y_out = quant(y_accum.float(), self.mx_output_fmt).to(dtype)
