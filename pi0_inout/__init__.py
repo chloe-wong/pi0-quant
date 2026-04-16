@@ -49,6 +49,12 @@ from .functional_models import (
     list_functional_models,
 )
 from .stats_tracker import StatsTracker, Component, StatsReport
+from .action_metrics import (
+    ActionMetrics,
+    ActionThresholds,
+    CheckResult,
+    compute_action_metrics,
+)
 from .eval_harness  import (
     QuantConfig,
     EvalResult,
@@ -100,6 +106,11 @@ __all__ = [
     "StatsTracker",
     "Component",
     "StatsReport",
+    # Action metrics
+    "ActionMetrics",
+    "ActionThresholds",
+    "CheckResult",
+    "compute_action_metrics",
     # Evaluation
     "QuantConfig",
     "EvalResult",
