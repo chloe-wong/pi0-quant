@@ -49,7 +49,10 @@ import torch.nn as nn
 from .quant_types import QuantFormat
 from .model_patcher import patch_model, unpatch_model, count_layers
 from .stats_tracker import StatsTracker, StatsReport, Component
-from .action_metrics import ActionMetrics, ActionThresholds, CheckResult, compute_action_metrics
+from .action_metrics import (
+    ActionMetrics, ActionThresholds, CheckResult, compute_action_metrics,
+    BaselineVariance, compute_baseline_variance_from_actions,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +356,51 @@ def results_to_dataframe(results: List[EvalResult]):
             rows.append({**base, **comp_row})
 
     return pd.DataFrame(rows)
+
+
+def compute_baseline_variance(
+    model: nn.Module,
+    observations: List[Any],
+    infer_fn: Callable[[nn.Module, Any], torch.Tensor],
+    n_seeds: int = 10,
+    base_seed: int = 0,
+    verbose: bool = True,
+) -> BaselineVariance:
+    """
+    Measure the FP32 model's intrinsic action variance across diffusion seeds.
+
+    Runs each observation n_seeds times with different torch.manual_seed()
+    values and measures the spread.  The resulting BaselineVariance can
+    generate ActionThresholds via .to_thresholds(k) — quantization error
+    below k * baseline_std is lost in the model's own noise.
+
+    Args:
+        model:        Unpatched FP32 model.
+        observations: List of observations to evaluate on.
+        infer_fn:     Callable (model, observation) → actions tensor.
+        n_seeds:      Number of different seeds per observation (default 10).
+        base_seed:    Starting seed value (seeds will be base_seed .. base_seed + n_seeds - 1).
+        verbose:      Print progress.
+
+    Returns:
+        BaselineVariance with per-step, per-dim, and percentile breakdowns.
+    """
+    if verbose:
+        print(f"[baseline] Measuring FP32 variance: {len(observations)} obs x {n_seeds} seeds...")
+
+    actions_per_obs: List[List[torch.Tensor]] = []
+    for i, obs in enumerate(observations):
+        seed_actions = []
+        for s in range(n_seeds):
+            torch.manual_seed(base_seed + s)
+            with torch.no_grad():
+                acts = infer_fn(model, obs)
+            seed_actions.append(acts.detach().cpu())
+        actions_per_obs.append(seed_actions)
+        if verbose and (i + 1) % max(1, len(observations) // 5) == 0:
+            print(f"  {i+1}/{len(observations)} observations done")
+
+    return compute_baseline_variance_from_actions(actions_per_obs)
 
 
 def save_results(results: List[EvalResult], path: str) -> None:

@@ -15,6 +15,15 @@ Usage:
     thresholds = ActionThresholds(max_rmse=0.05, max_rel_rmse=0.02)
     verdict = metrics.check(thresholds)
     print(verdict)          # PASS or FAIL with details
+
+Baseline variance (model's intrinsic noise floor):
+    from pi0_inout import compute_baseline_variance
+    baseline = compute_baseline_variance(model, observations, infer_fn, n_seeds=10)
+    baseline.print_report()
+
+    # Auto-generate thresholds: quantization error must be < 1x the model's own noise
+    thresholds = baseline.to_thresholds(k=1.0)
+    verdict = metrics.check(thresholds)
 """
 
 from __future__ import annotations
@@ -352,6 +361,191 @@ def compute_action_metrics(
         max_abs_error=max_abs_error,
         max_abs_error_location=max_abs_error_location,
         n_observations=n_obs,
+        action_horizon=action_horizon,
+        action_dim=action_dim,
+        dim_labels=dim_labels,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Baseline variance — FP32 model's intrinsic noise floor
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BaselineVariance:
+    """
+    Measures the FP32 model's own action variance across diffusion seeds.
+
+    The idea: run the same observation N times with different
+    torch.manual_seed() values.  The resulting spread in actions is the
+    model's intrinsic noise — quantization error below this floor is
+    indistinguishable from the model's own randomness.
+
+    Use to_thresholds(k) to auto-generate ActionThresholds where each
+    limit is k * the corresponding baseline statistic.
+    """
+    # Overall std of actions across seeds (averaged over all elements)
+    overall_std: float
+
+    # Per-timestep: std at each step in the horizon, averaged over dims and obs
+    per_step_std: List[float]           # [action_horizon]
+
+    # Per-dimension: std for each action dim, averaged over steps and obs
+    per_dim_std: List[float]            # [action_dim]
+
+    # Per-sample: std for each observation, averaged over steps and dims
+    per_sample_std: List[float]         # [n_observations]
+
+    # Percentiles of per-element std (across all obs/step/dim positions)
+    percentiles: Dict[str, float]       # {"p50": ..., "p90": ..., "p95": ..., "p99": ...}
+
+    # Metadata
+    n_observations: int
+    n_seeds: int
+    action_horizon: int
+    action_dim: int
+    dim_labels: Optional[List[str]] = None
+
+    def to_thresholds(self, k: float = 1.0) -> ActionThresholds:
+        """
+        Generate ActionThresholds from baseline variance.
+
+        k is a multiplier:
+            k=1.0 — quant error must be smaller than the model's own noise (strict)
+            k=2.0 — quant error can be up to 2x the model's noise (moderate)
+            k=0.5 — quant error must be half the model's noise (very strict)
+        """
+        return ActionThresholds(
+            max_rmse=k * self.overall_std,
+            max_per_step_rmse=k * max(self.per_step_std),
+            max_per_dim_rmse=k * max(self.per_dim_std),
+            max_p99_abs_error=k * self.percentiles["p99"],
+        )
+
+    def print_report(self) -> None:
+        print(f"\n{'='*64}")
+        print("BASELINE VARIANCE REPORT (FP32 model noise floor)")
+        print(f"{'='*64}")
+        print(f"  observations:    {self.n_observations}")
+        print(f"  seeds per obs:   {self.n_seeds}")
+        print(f"  action_horizon:  {self.action_horizon}")
+        print(f"  action_dim:      {self.action_dim}")
+
+        print(f"\n--- Overall ---")
+        print(f"  std:  {self.overall_std:.6e}")
+
+        print(f"\n--- Seed Variance Percentiles (per-element std) ---")
+        for k in ("p50", "p90", "p95", "p99"):
+            print(f"  {k:>4s}:  {self.percentiles[k]:.6e}")
+
+        print(f"\n--- Per-Timestep std ---")
+        n_show = min(self.action_horizon, 5)
+        for t in range(n_show):
+            print(f"  t={t:<3d}  std={self.per_step_std[t]:.6e}")
+        if n_show < self.action_horizon:
+            print(f"  ... ({self.action_horizon - n_show} more, "
+                  f"max={max(self.per_step_std):.6e} at t={self.per_step_std.index(max(self.per_step_std))})")
+
+        print(f"\n--- Per-Dimension std (worst first) ---")
+        n_show_d = min(self.action_dim, 8)
+        indexed = sorted(enumerate(self.per_dim_std), key=lambda x: -x[1])
+        for rank, (idx, std) in enumerate(indexed[:n_show_d]):
+            label = self.dim_labels[idx] if self.dim_labels else f"dim_{idx}"
+            print(f"  #{rank+1:<2d}  {label:<12s}  std={std:.6e}")
+        if n_show_d < self.action_dim:
+            print(f"  ... ({self.action_dim - n_show_d} more dims)")
+
+        print(f"\n--- Suggested thresholds ---")
+        for k_val, label in [(0.5, "strict"), (1.0, "moderate"), (2.0, "lenient")]:
+            t = self.to_thresholds(k_val)
+            print(f"  k={k_val} ({label}):  max_rmse={t.max_rmse:.4e}  "
+                  f"max_p99={t.max_p99_abs_error:.4e}")
+
+        print(f"{'='*64}")
+
+    def to_dict(self) -> dict:
+        return {
+            "overall_std":      self.overall_std,
+            "per_step_std":     self.per_step_std,
+            "per_dim_std":      self.per_dim_std,
+            "per_sample_std":   self.per_sample_std,
+            "percentiles":      self.percentiles,
+            "n_observations":   self.n_observations,
+            "n_seeds":          self.n_seeds,
+            "action_horizon":   self.action_horizon,
+            "action_dim":       self.action_dim,
+            "dim_labels":       self.dim_labels,
+        }
+
+
+def compute_baseline_variance_from_actions(
+    actions_per_obs: List[List[torch.Tensor]],
+    dim_labels: Optional[List[str]] = None,
+) -> BaselineVariance:
+    """
+    Compute baseline variance from pre-collected multi-seed action tensors.
+
+    Args:
+        actions_per_obs: Outer list is per observation, inner list is per seed.
+                         Each tensor is [action_horizon, action_dim] (or [1, H, D]).
+        dim_labels:      Optional human-readable names for each action dimension.
+
+    Returns:
+        BaselineVariance with all breakdowns.
+    """
+    n_obs = len(actions_per_obs)
+    assert n_obs > 0, "Need at least one observation"
+    n_seeds = len(actions_per_obs[0])
+    assert n_seeds >= 2, f"Need at least 2 seeds for variance, got {n_seeds}"
+
+    # Normalize shapes and stack: [n_obs, n_seeds, H, D]
+    all_actions = []
+    for obs_actions in actions_per_obs:
+        assert len(obs_actions) == n_seeds, (
+            f"All observations must have same number of seeds, "
+            f"got {len(obs_actions)} vs {n_seeds}"
+        )
+        seed_tensors = []
+        for a in obs_actions:
+            a_f = a.float().cpu()
+            if a_f.dim() == 3 and a_f.shape[0] == 1:
+                a_f = a_f.squeeze(0)
+            seed_tensors.append(a_f)
+        all_actions.append(torch.stack(seed_tensors))  # [n_seeds, H, D]
+
+    stacked = torch.stack(all_actions)  # [n_obs, n_seeds, H, D]
+    action_horizon = stacked.shape[2]
+    action_dim = stacked.shape[3]
+
+    # Std across seeds (dim=1), giving [n_obs, H, D]
+    per_element_std = stacked.std(dim=1)  # unbiased (Bessel's correction)
+
+    # Overall: mean of per-element std
+    overall_std = per_element_std.mean().item()
+
+    # Per-timestep: mean over (n_obs, D)
+    per_step_std = per_element_std.mean(dim=(0, 2)).tolist()  # [H]
+
+    # Per-dimension: mean over (n_obs, H)
+    per_dim_std = per_element_std.mean(dim=(0, 1)).tolist()   # [D]
+
+    # Per-sample: mean over (H, D)
+    per_sample_std = per_element_std.mean(dim=(1, 2)).tolist()  # [n_obs]
+
+    # Percentiles of per-element std
+    flat_std = per_element_std.flatten()
+    percentiles = {}
+    for name, q in [("p50", 0.50), ("p90", 0.90), ("p95", 0.95), ("p99", 0.99)]:
+        percentiles[name] = torch.quantile(flat_std, q).item()
+
+    return BaselineVariance(
+        overall_std=overall_std,
+        per_step_std=per_step_std,
+        per_dim_std=per_dim_std,
+        per_sample_std=per_sample_std,
+        percentiles=percentiles,
+        n_observations=n_obs,
+        n_seeds=n_seeds,
         action_horizon=action_horizon,
         action_dim=action_dim,
         dim_labels=dim_labels,
