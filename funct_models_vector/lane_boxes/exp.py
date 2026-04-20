@@ -43,7 +43,7 @@ class FPEXResp:
 
 def _load_exact_exp_bf16_bits():
     model_path = (
-        Path(__file__).resolve().parents[5]
+        Path(__file__).resolve().parents[2]
         / "dependencies"
         / "fpex"
         / "model"
