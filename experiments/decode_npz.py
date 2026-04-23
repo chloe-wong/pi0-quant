@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-verify_npz.py — Decode a MatmulIOStore .npz file and recover original float values.
+decode_npz.py — Decode a MatmulIOStore .npz file and recover original float values.
 
 Usage:
-    python verify_npz.py path/to/layer.npz [--summary] [--call 0] [--log-dir DIR]
+    python decode_npz.py path/to/layer.npz [--summary] [--call 0] [--log-dir DIR]
 
 Requirements: torch >= 2.1, numpy
 
@@ -14,7 +14,7 @@ Unpatched fields (unpatched_x, unpatched_w, unpatched_b, unpatched_y):
     value = reinterpret_cast<bfloat16>(int16_array)
 
 Patched inputs/weight/bias (FP8 E4M3):
-    stored as (uint8 raw-bit-pattern, int32 scale exponent)
+    stored as (uint8 raw-bit-pattern, int8 scale exponent)
     value = reinterpret_cast<float8_e4m3fn>(uint8_array) * (2 ** scale_exp)
     where scale_exp is ONE integer for the ENTIRE tensor (po2 mode only):
       scale_exp = floor(log2(max(|x_ij|) / 256.0))
@@ -100,18 +100,21 @@ def load_layer(path: str, call_idx: int = 0):
     return results, scale_exps, data
 
 
-def summarize(tensors: dict, scale_exps: dict):
-    print(f"{'Field':<20}  {'Shape':<25}  {'min':>12}  {'max':>12}  {'mean':>12}")
-    print("-" * 85)
+def summarize(tensors: dict, scale_exps: dict, *, emit=print):
+    lines = []
+    lines.append(f"{'Field':<20}  {'Shape':<25}  {'min':>12}  {'max':>12}  {'mean':>12}  {'scale_exp':>10}")
+    lines.append("-" * 97)
     for name, t in tensors.items():
         # fp8 doesn't support min/max/mean — cast to float32 with scale applied
         if name in scale_exps:
             t_f = t.float() * (2.0 ** scale_exps[name])
         else:
             t_f = t
-        print(f"{name:<20}  {str(tuple(t_f.shape)):<25}  "
-              f"{t_f.min().item():>12.6f}  {t_f.max().item():>12.6f}  "
-              f"{t_f.mean().item():>12.6f}")
+        exp_str = str(scale_exps[name]) if name in scale_exps else ""
+        lines.append(f"{name:<20}  {str(tuple(t_f.shape)):<25}  "
+                     f"{t_f.min().item():>12.6f}  {t_f.max().item():>12.6f}  "
+                     f"{t_f.mean().item():>12.6f}  {exp_str:>10}")
+    emit("\n".join(lines))
 
 
 def main():
@@ -144,21 +147,7 @@ def main():
     tensors, scale_exps, _ = load_layer(args.npz, call_idx=args.call)
 
     if args.summary:
-        lines = []
-        lines.append(f"{'Field':<20}  {'Shape':<25}  {'min':>12}  {'max':>12}  {'mean':>12}  {'scale_exp':>10}")
-        lines.append("-" * 97)
-        for name, t in tensors.items():
-            if name in scale_exps:
-                t_f = t.float() * (2.0 ** scale_exps[name])
-            else:
-                t_f = t
-            exp_str = str(scale_exps[name]) if name in scale_exps else ""
-            lines.append(
-                f"{name:<20}  {str(tuple(t_f.shape)):<25}  "
-                f"{t_f.min().item():>12.6f}  {t_f.max().item():>12.6f}  "
-                f"{t_f.mean().item():>12.6f}  {exp_str:>10}"
-            )
-        emit("\n".join(lines))
+        summarize(tensors, scale_exps, emit=emit)
     else:
         for name, t in tensors.items():
             exp_str = f"  scale_exp={scale_exps[name]}  (scale={2**scale_exps[name]})" if name in scale_exps else ""

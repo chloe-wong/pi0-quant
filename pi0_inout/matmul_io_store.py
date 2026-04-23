@@ -23,7 +23,7 @@ Patched pass (via QuantLinear.forward):
 
 BF16 arrays stored as int16 raw bits (numpy lacks native bf16).
   Reconstruct: torch.from_numpy(arr).view(torch.bfloat16)
-FP8 arrays stored as uint8 raw bits + int32 scale exponent.
+FP8 arrays stored as uint8 raw bits + int8 scale exponent.
   Reconstruct: torch.from_numpy(arr).view(torch.float8_e4m3fn) * (2 ** scale_exp)
 
 File naming
