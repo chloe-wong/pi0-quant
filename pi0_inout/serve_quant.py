@@ -2,39 +2,34 @@
 serve_quant.py
 --------------
 Drop-in replacement for openpi/scripts/serve_policy.py that serves
-PI0Pytorch with configurable matmul input/output quantization.
+Pi0Pytorch with hardware-accurate simulation via functional models.
 
 How it works
 ------------
 1. Adds openpi/src and openpi-client/src to sys.path.
 2. Injects lightweight Python stubs for the three openpi files that import
    JAX at module level (gemma config, lora config, array_typing, image_tools).
-   This lets PI0Pytorch be imported in the pi0 conda env (torch-only).
-3. Instantiates PI0Pytorch from a hardcoded config dict for the known
+   This lets Pi0Pytorch be imported in the pi0 conda env (torch-only).
+3. Instantiates Pi0Pytorch from a hardcoded config dict for the known
    training configs (no JAX config system required).
 4. Loads weights from a local safetensors checkpoint if available.
-5. Patches every nn.Linear with QuantLinear (mx_input_fmt / mx_output_fmt).
-6. Serves via the openpi WebSocket protocol (msgpack + websockets).
-7. On SIGTERM/SIGINT, writes per-layer RMSE stats to --stats-output.
+5. Patches every nn.Linear with QuantLinear routed through the chosen
+   matrix functional model (IPT / systolic), or BF16 passthrough if omitted.
+6. Patches all vector ops through VectorRTLFunctions if --vec-functional-model
+   is set, or passthrough if omitted.
+7. Serves via the openpi WebSocket protocol (msgpack + websockets).
+8. On SIGTERM/SIGINT, writes per-layer RMSE stats to --stats-output.
 
-Quantization semantics (unchanged from quant_linear.py)
----------------------------------------------------------
-For each nn.Linear:
-    x_q  = quant(x,    mx_input_fmt)
-    W_q  = quant(W,    mx_input_fmt)
-    b_q  = quant(bias, mx_input_fmt)       # bias loaded in mx_input_fmt
-    y    = F.linear(x_q, W_q, b_q)        # float32 accumulation
-    out  = quant(y, mx_output_fmt)         # single output quantization
-
-BFLOAT16/BFLOAT16 is the identity — zero RMSE baseline.
+Both paths are independent. Omitting both gives a zero-RMSE BF16 baseline.
 
 Usage
 -----
     python serve_quant.py \\
         --openpi-dir /path/to/openpi \\
         --checkpoint-dir /path/to/model.safetensors_dir \\
-        --config pi05_droid_jointpos_polaris \\
-        --mx-input-fmt float8_e4m3 --mx-output-fmt float16 \\
+        --config pi0_droid_jointpos_polaris \\
+        --functional-model ipt_numba \\
+        --vec-functional-model vector \\
         --port 8003 --gpu 0
 """
 
@@ -43,6 +38,7 @@ from __future__ import annotations
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import argparse
 import atexit
+import contextlib
 import json
 import logging
 import os
@@ -75,7 +71,7 @@ import torch
 import torch.nn as nn
 
 # ── pi0_inout imports (quantization layer) ────────────────────────────────────
-from pi0_inout.quant_types import QuantFormat, TORCH_DTYPE, FORMAT_BITS, set_fp8_mode
+from pi0_inout.quant_types import QuantFormat, set_fp8_mode
 from pi0_inout.model_patcher import (
     patch_model, list_linear_layers,
     QuantGroup, ALL_GROUPS,
@@ -84,6 +80,8 @@ from pi0_inout.model_patcher import (
 from pi0_inout.quant_linear import QuantLinear
 from pi0_inout.rel_noise import NoiseMode
 from pi0_inout.stats_tracker import StatsTracker
+from pi0_inout.functional_models import get_functional_model_factory, list_functional_models
+from pi0_inout.quant_vector import patch_vector_ops, unpatch_vector_ops
 
 
 # ---------------------------------------------------------------------------
@@ -285,124 +283,23 @@ def _load_norm_stats(norm_stats_dir: str) -> dict:
 # Post-patch diagnostics
 # ---------------------------------------------------------------------------
 
-def print_quant_diagnostics(
+def print_patch_diagnostics(
     model: nn.Module,
-    mx_input_fmt: QuantFormat,
-    mx_output_fmt: QuantFormat,
+    functional_model: Optional[str],
+    vec_functional_model: Optional[str],
 ) -> None:
-    """
-    Print model structure and memory analysis after quantization patching.
-    Shows that this is SIMULATED quantization (weights stay in original dtype).
-    """
-    print("\n" + "=" * 80)
-    print("QUANTIZATION DIAGNOSTICS")
-    print("=" * 80)
+    """Print a brief summary of the patched model configuration."""
+    n_quant = sum(1 for _, m in model.named_modules() if isinstance(m, QuantLinear))
+    n_plain = sum(1 for _, m in model.named_modules() if type(m) is nn.Linear)
 
-    # 1. Layer inventory: count QuantLinear vs plain nn.Linear
-    n_quant = 0
-    n_plain = 0
-    total_params = 0
-    quant_params = 0
-    sample_layer = None
-
-    for name, module in model.named_modules():
-        if isinstance(module, QuantLinear):
-            n_quant += 1
-            n_params = module.weight.numel() + (module.bias.numel() if module.bias is not None else 0)
-            quant_params += n_params
-            total_params += n_params
-            if sample_layer is None:
-                sample_layer = (name, module)
-        elif type(module) is nn.Linear:
-            n_plain += 1
-            n_params = module.weight.numel() + (module.bias.numel() if module.bias is not None else 0)
-            total_params += n_params
-
-    print(f"\n[1] Layer counts:")
-    print(f"    QuantLinear layers: {n_quant}")
-    print(f"    Plain nn.Linear:   {n_plain}")
-    print(f"    Total parameters:  {total_params:,}")
-    print(f"    Quantized params:  {quant_params:,}")
-
-    # 2. Print a few representative QuantLinear layers
-    print(f"\n[2] Sample QuantLinear layers (first 5):")
-    print(f"    {'Name':<60s}  {'Weight dtype':<12s}  mx_input_fmt    mx_output_fmt")
-    print("    " + "-" * 110)
-    count = 0
-    for name, module in model.named_modules():
-        if isinstance(module, QuantLinear):
-            print(f"    {name:<60s}  {str(module.weight.dtype):<12s}  "
-                  f"{module.mx_input_fmt.value:<15s} {module.mx_output_fmt.value}")
-            count += 1
-            if count >= 5:
-                print(f"    ... ({n_quant - 5} more)")
-                break
-
-    # 3. Memory analysis
-    input_bits = FORMAT_BITS[mx_input_fmt]["total"]
-    bf16_bits = 16
-
-    # Actual memory used (weights stay in original dtype)
-    actual_bytes = 0
-    for p in model.parameters():
-        actual_bytes += p.numel() * p.element_size()
-
-    # Hypothetical memory if weights were ACTUALLY stored in input_fmt
-    hypothetical_bytes = 0
-    for name, module in model.named_modules():
-        if isinstance(module, QuantLinear):
-            n = module.weight.numel() + (module.bias.numel() if module.bias is not None else 0)
-            hypothetical_bytes += n * (input_bits // 8)
-        elif type(module) is nn.Linear:
-            for p in module.parameters():
-                hypothetical_bytes += p.numel() * p.element_size()
-    # Add non-linear params at their actual size
-    linear_param_ids = set()
-    for name, module in model.named_modules():
-        if isinstance(module, (QuantLinear, nn.Linear)):
-            for p in module.parameters():
-                linear_param_ids.add(id(p))
-    for p in model.parameters():
-        if id(p) not in linear_param_ids:
-            hypothetical_bytes += p.numel() * p.element_size()
-
-    bf16_bytes = total_params * (bf16_bits // 8)
-
-    print(f"\n[3] Memory analysis:")
-    print(f"    Actual GPU memory (weights in original dtype): {actual_bytes / 1e9:.3f} GB")
-    print(f"    Hypothetical if stored as {mx_input_fmt.value}:   {hypothetical_bytes / 1e9:.3f} GB")
-    print(f"    Reference bf16 size (linear params only):      {bf16_bytes / 1e9:.3f} GB")
-    print(f"    Compression ratio (hypothetical vs bf16):      {bf16_bytes / max(hypothetical_bytes, 1):.2f}x")
-    print(f"    NOTE: Actual memory is UNCHANGED — this is simulated quantization.")
-    print(f"          Weights are stored in {sample_layer[1].weight.dtype if sample_layer else 'N/A'}, "
-          f"cast through {mx_input_fmt.value} at runtime.")
-
-    # 4. Verify quantization actually changes values (pick one weight tensor)
-    if sample_layer is not None:
-        name, layer = sample_layer
-        w = layer.weight.detach().float()
-        target_dtype = TORCH_DTYPE[input_fmt]
-        w_quant = w.to(target_dtype).to(w.dtype)
-        diff = (w - w_quant).abs()
-        n_changed = (diff > 0).sum().item()
-        n_total = w.numel()
-
-        print(f"\n[4] Quantization verification (layer: {name}):")
-        print(f"    Weight shape:        {tuple(w.shape)}")
-        print(f"    Weight dtype:        {layer.weight.dtype}")
-        print(f"    Target quant dtype:  {target_dtype}")
-        print(f"    Values changed:      {n_changed:,} / {n_total:,} "
-              f"({100 * n_changed / n_total:.1f}%)")
-        print(f"    Max abs difference:  {diff.max().item():.6e}")
-        print(f"    Mean abs difference: {diff.mean().item():.6e}")
-        if n_changed == 0 and mx_input_fmt != QuantFormat.BFLOAT16:
-            print(f"    WARNING: No values changed! Quantization may not be working.")
-        elif mx_input_fmt == QuantFormat.BFLOAT16:
-            print(f"    OK: BFLOAT16 baseline — zero difference expected (no-op).")
-        else:
-            print(f"    OK: Quantization is actively rounding values.")
-
-    print("\n" + "=" * 80 + "\n")
+    print("\n" + "=" * 60)
+    print("PATCH DIAGNOSTICS")
+    print("=" * 60)
+    print(f"  QuantLinear layers : {n_quant}")
+    print(f"  Plain nn.Linear    : {n_plain}")
+    print(f"  Matrix path        : {functional_model or 'passthrough (BF16)'}")
+    print(f"  Vector path        : {vec_functional_model or 'passthrough'}")
+    print("=" * 60 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +326,7 @@ class Pi0PyTorchPolicy:
         model: nn.Module,
         device: torch.device,
         *,
+        vec_ctx=None,
         norm_stats: dict | None = None,
         use_quantile_norm: bool = False,
         is_joint_position: bool = False,
@@ -437,6 +335,7 @@ class Pi0PyTorchPolicy:
     ) -> None:
         self.model    = model
         self.device   = device
+        self._vec_ctx = vec_ctx
         self.metadata: dict = {"model": "PI0Pytorch", "quantized": True}
         self.norm_stats = norm_stats
         self.use_quantile_norm = use_quantile_norm
@@ -575,7 +474,8 @@ class Pi0PyTorchPolicy:
             token_loss_mask=token_loss_mask,
         )
 
-        with torch.no_grad():
+        vec = self._vec_ctx if self._vec_ctx is not None else contextlib.nullcontext()
+        with torch.no_grad(), vec:
             actions = self.model.sample_actions(str(dev), obs_ns, num_steps=10)
         # actions: [1, action_horizon, 32]  (normalized action space)
         actions = actions.squeeze(0).cpu().numpy()  # (horizon, 32)
@@ -635,24 +535,33 @@ def main() -> None:
         print(f"\nTotal linear layers: {len(rows)}")
         return
 
-    # ── Parse formats and set FP8 mode ────────────────────────────────────
-    set_fp8_mode(args.fp8_mode)
-    logger.info(f"FP8 quantization mode: {args.fp8_mode}")
-
-    mx_input_fmt  = QuantFormat(args.mx_input_fmt)
-    mx_output_fmt = QuantFormat(args.mx_output_fmt)
+    # ── Resolve functional models and patch ───────────────────────────────
+    set_fp8_mode("po2")
 
     active_groups = {QuantGroup(g) for g in args.quantize_components}
+    noise_mode    = NoiseMode(args.noise_mode)
 
-    noise_mode = NoiseMode(args.noise_mode)
+    fm_factory = None
+    if args.functional_model:
+        fm_factory = get_functional_model_factory(args.functional_model)
 
-    tracker = StatsTracker()
+    vec_fm      = None
+    vec_handles = []
+    vec_ctx     = None
+    if args.vec_functional_model is not None:
+        from funct_models_vector.vector_rtl_forward import VectorRTLFunctions
+        vec_fm = VectorRTLFunctions(num_lanes=16)
+
+    tracker     = StatsTracker()
+    vec_tracker = StatsTracker()
+
     patch_model(
         model=model,
-        mx_input_fmt=mx_input_fmt,
-        mx_output_fmt=mx_output_fmt,
+        mx_input_fmt=QuantFormat.BFLOAT16,   # passthrough; FM handles actual compute
+        mx_output_fmt=QuantFormat.BFLOAT16,
         tracker=tracker,
         active_groups=active_groups,
+        functional_model_factory=fm_factory,
         noise_injection=args.rel_err,
         noise_mode=noise_mode,
         verbose=False,
@@ -660,29 +569,43 @@ def main() -> None:
     attn_handles = patch_attn_sdpa(
         model=model,
         active_groups=active_groups,
-        mx_input_fmt=mx_input_fmt,
-        mx_output_fmt=mx_output_fmt,
         tracker=tracker,
+        functional_model_factory=fm_factory,
     )
+    vec_handles, vec_ctx, _hook_fires = patch_vector_ops(
+        model,
+        active_groups=active_groups,
+        tracker=vec_tracker,
+        functional_model=vec_fm,
+    )
+
+    fm_label  = args.functional_model     or "passthrough"
+    vec_label = args.vec_functional_model or "passthrough"
     logger.info(
-        f"Model patched: mx_input_fmt={mx_input_fmt.value}  mx_output_fmt={mx_output_fmt.value}  "
+        f"Model patched: functional_model={fm_label}  vec={vec_label}  "
         f"rel_err={args.rel_err}  noise_mode={noise_mode.value}  "
         f"components={args.quantize_components}"
     )
 
-    # ── Print quantization diagnostics ────────────────────────────────────
-    print_quant_diagnostics(model, mx_input_fmt, mx_output_fmt)
+    # ── Print patch diagnostics ───────────────────────────────────────────
+    print_patch_diagnostics(model, args.functional_model, args.vec_functional_model)
 
     # ── Register stats dump on exit ───────────────────────────────────────
     def _dump_stats() -> None:
         unpatch_attn_sdpa(attn_handles)
-        logger.info("=== Quantization RMSE Report ===")
-        report = tracker.summary()
-        report.print(show_layers=False)
+        unpatch_vector_ops(vec_handles)
+        logger.info("=== Matrix path RMSE ===")
+        tracker.summary().print(show_layers=False)
+        logger.info("=== Vector path RMSE ===")
+        vec_tracker.summary().print(show_layers=False)
         if args.stats_output:
             Path(args.stats_output).parent.mkdir(parents=True, exist_ok=True)
+            combined = {
+                "matrix": tracker.summary().to_dict(),
+                "vector": vec_tracker.summary().to_dict(),
+            }
             with open(args.stats_output, "w") as f:
-                json.dump(report.to_dict(), f, indent=2)
+                json.dump(combined, f, indent=2)
             logger.info(f"Stats saved to {args.stats_output}")
 
     atexit.register(_dump_stats)
@@ -717,6 +640,7 @@ def main() -> None:
     policy = Pi0PyTorchPolicy(
         model=model,
         device=device,
+        vec_ctx=vec_ctx,
         norm_stats=norm_stats,
         use_quantile_norm=use_quantile_norm,
         is_joint_position=is_joint_position,
@@ -724,17 +648,16 @@ def main() -> None:
         tokenizer_path=args.tokenizer_path,
     )
     policy.metadata["quant"] = {
-        "mx_input_fmt": mx_input_fmt.value,
-        "mx_output_fmt": mx_output_fmt.value,
-        "rel_err": args.rel_err,
-        "noise_mode": noise_mode.value,
+        "functional_model":     fm_label,
+        "vec_functional_model": vec_label,
+        "rel_err":              args.rel_err,
+        "noise_mode":           noise_mode.value,
     }
 
     from openpi.serving import websocket_policy_server
     import socket
     logger.info(f"Starting server on {socket.gethostname()}:{args.port}  "
-                f"(mx_input={mx_input_fmt.value}, mx_output={mx_output_fmt.value}, "
-                f"rel_err={args.rel_err})")
+                f"(matrix={fm_label}, vector={vec_label}, rel_err={args.rel_err})")
 
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
@@ -769,17 +692,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gpu",   type=int, default=0,
                    help="CUDA device index (-1 for CPU)")
 
-    # Quantization
-    p.add_argument("--mx-input-fmt",  default="bfloat16",
-                   choices=[f.value for f in QuantFormat])
-    p.add_argument("--mx-output-fmt", default="bfloat16",
-                   choices=[f.value for f in QuantFormat])
-    p.add_argument("--fp8-mode", default="po2",
-                   choices=["scaled", "clamped", "mx"],
-                   help="FP8 quantization mode: "
-                        "'scaled' = per-tensor absmax (default), "
-                        "'clamped' = clamp to range + flush subnormals, "
-                        "'mx' = MX-compliant power-of-two block scaling")
+    # Simulation paths (both optional; omitting both gives BF16 passthrough)
+    p.add_argument("--functional-model", default=None, metavar="NAME",
+                   help=f"Hardware-accurate matrix functional model. "
+                        f"Available: {list_functional_models()}")
+    p.add_argument("--vec-functional-model", default=None,
+                   choices=["vector"],
+                   help="Route all vector ops through VectorRTLFunctions. "
+                        "Currently the only option is 'vector'.")
     p.add_argument(
         "--quantize-components",
         nargs="+",

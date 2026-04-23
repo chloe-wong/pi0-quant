@@ -38,6 +38,7 @@ from .model_patcher import (
     OpScope, ALL_SCOPES,
     patch_attn_sdpa, unpatch_attn_sdpa,
     patch_attn_eager, unpatch_attn_eager,
+    patch_attn_siglip_eager, unpatch_attn_siglip_eager,
 )
 from .quant_vector import (
     patch_vector_ops, unpatch_vector_ops,
@@ -87,6 +88,8 @@ __all__ = [
     "unpatch_attn_sdpa",
     "patch_attn_eager",
     "unpatch_attn_eager",
+    "patch_attn_siglip_eager",
+    "unpatch_attn_siglip_eager",
     # Vector ops
     "patch_vector_ops",
     "unpatch_vector_ops",

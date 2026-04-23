@@ -4,53 +4,50 @@ quant_vector.py
 Vector-engine operation quantization for Pi0Pytorch.
 
 Every listed vector op in every layer of the model is intercepted via
-TorchDispatchMode and quantized with configurable input/output formats,
-independently from the matmul (QuantLinear / patch_attn_sdpa) quantization.
+TorchDispatchMode.  With --vec-functional-model active, ops route through
+VectorRTLFunctions (lane-box RTL-accurate simulation).  Without it, ops
+pass through unchanged (passthrough mode).
 
 Covered operations
 ------------------
-  Add / Sub       (2 tensor inputs)
-  Multiply        (2 tensor inputs)
-  Square / Cube   (pow with scalar exponent)
+  Add / Sub             (Tensor and Scalar variants)
+  Multiply              (Tensor and Scalar variants)
   Div / Reciprocal
-  Sqrt
-  Sin / Cos
-  Tanh
-  Log2
-  Exp / Exp2
-  AMax reduction  (max over dims, returns tensor)
-  Sum reduction
+  Square / Cube         (via pow.Tensor_Scalar)
+  Sqrt / Rsqrt
+  Sin / Cos / Tanh / Log2 / Exp / Exp2 / Neg
+  AMax / Sum reductions
+  Mean reduction        (for GemmaRMSNorm)
+  nn.LayerNorm          (fused aten.native_layer_norm)
+  F.softmax             (fused aten._softmax)
+  GELU tanh approx      (fused aten.gelu)
+  SiLU                  (fused aten.silu)
 
 Usage
 -----
-    from pi0_inout import patch_model, patch_attn_sdpa
     from pi0_inout.quant_vector import patch_vector_ops, unpatch_vector_ops
+    from funct_models_vector.vector_rtl_forward import VectorRTLFunctions
 
-    active = {QuantGroup.TRANSFORMER}
-    patch_model(model, mx_input_fmt=FP8, mx_output_fmt=FP16, active_groups=active)
-    attn_h = patch_attn_sdpa(model, active_groups=active, ...)
-    vec_h, vec_ctx = patch_vector_ops(model, active_groups=active,
-                                      vec_input_fmt=FP8, vec_output_fmt=FP16)
+    vrf = VectorRTLFunctions(num_lanes=16)
+    vec_h, vec_ctx, hook_fires = patch_vector_ops(model, active_groups=active, functional_model=vrf)
     with vec_ctx:
         actions = model.sample_actions(...)
-
-    unpatch_attn_sdpa(attn_h)
-    unpatch_model(model)
     unpatch_vector_ops(vec_h)
 
-Component attribution
+Layer-tag attribution
 ---------------------
-The same component-tagging rules from model_patcher._infer_component are
-reused.  Forward hooks are placed on the top-level boundary module for each
-component (the outermost module where the component tag first appears).  A
-thread-local stack tracks which component is currently executing so that the
-dispatch handler can gate quantization correctly.
+Forward hooks on transformer layer boundaries push (Component, layer_tag) pairs
+onto a thread-local stack so __torch_dispatch__ can label each op.  layer_tag
+examples: "vision", "language.7", "expert.3", "action_head", "unattributed".
+
+All ops in TARGET_OPS are routed through VRF unconditionally — there is no
+attribution gate.  Ops that fire outside any hooked module (final RMSNorm,
+Euler step) are labelled "unattributed" and still go through VRF.
 
 Re-entrant guard
 ----------------
-quant() itself calls .float() and .to(), which are aten ops that would
-re-enter __torch_dispatch__.  A thread-local 'inside_quant' guard suppresses
-re-entrant dispatch so quantization calls are not themselves quantized.
+A thread-local '_in_quant_guard' suppresses re-entrant dispatch so tensor
+operations inside VPU decompositions are not themselves re-intercepted.
 """
 
 from __future__ import annotations
@@ -59,13 +56,76 @@ import threading
 from typing import Optional
 
 import torch
-from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from collections import defaultdict
+
 from ._dispatch_guards import _in_quant_guard
-from .model_patcher import QuantGroup, _active_components, _infer_component
-from .quant_types import QuantFormat, quant
+from .model_patcher import QuantGroup
 from .stats_tracker import Component, StatsTracker
+
+
+# ---------------------------------------------------------------------------
+# Action-head module names (top-level — depth 0, no dots in name)
+# ---------------------------------------------------------------------------
+
+_ACTION_HEAD_MODULES: frozenset = frozenset({
+    "action_in_proj", "action_out_proj", "action_time_mlp_in",
+    "action_time_mlp_out", "state_proj", "time_mlp_in", "time_mlp_out",
+})
+
+
+# ---------------------------------------------------------------------------
+# Layer-tag detection for vec hooks (labeling only, not gating)
+# ---------------------------------------------------------------------------
+
+def _vec_layer_tag_for_module(name: str) -> Optional[tuple[Component, str]]:
+    """
+    Return (Component, layer_tag) for module `name`, or None if not a hook site.
+
+    layer_tag format:
+      "vision"        — SigLIP vision encoder (hooked as a container)
+      "language.N"    — language model decoder layer N
+      "expert.N"      — action-expert decoder layer N
+      "action_head"   — top-level action projection modules
+
+    Rules (checked in priority order):
+      1. vision_tower container — last segment == "vision_tower"
+      2. language decoder layers — ...language_model.layers.<int>
+      3. action-expert decoder layers — ...gemma_expert.*.layers.<int>
+      4. action-head top-level linears — depth-0 names in _ACTION_HEAD_MODULES
+    """
+    parts = name.split(".")
+    last  = parts[-1]
+
+    if last == "vision_tower":
+        return (Component.VISION, "vision")
+
+    if (len(parts) >= 2 and last.isdigit()
+            and parts[-2] == "layers" and "language_model" in name
+            and "gemma_expert" not in name):
+        return (Component.LANGUAGE, f"language.{last}")
+
+    if (len(parts) >= 2 and last.isdigit()
+            and parts[-2] == "layers" and "gemma_expert" in name):
+        return (Component.ACTION_EXPERT, f"expert.{last}")
+
+    if "." not in name and name in _ACTION_HEAD_MODULES:
+        return (Component.ACTION_HEAD, "action_head")
+
+    return None
+
+
+from .vpu_decomp import (
+    _VEC_FM_DISPATCH,
+    _vpu_gelu_tanh,
+    _vpu_layer_norm,
+    _vpu_rmax_all,
+    _vpu_rsqrt,
+    _vpu_rsum_all,
+    _vpu_silu,
+    _vpu_softmax,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,87 +133,89 @@ from .stats_tracker import Component, StatsTracker
 # ---------------------------------------------------------------------------
 
 TARGET_OPS: frozenset = frozenset({
-    # Add / Sub
+    # ── Add / Sub ─────────────────────────────────────────────────────────────
     torch.ops.aten.add.Tensor,
+    torch.ops.aten.add.Scalar,
     torch.ops.aten.sub.Tensor,
-    # Multiply
+    torch.ops.aten.sub.Scalar,
+    # ── Multiply ──────────────────────────────────────────────────────────────
     torch.ops.aten.mul.Tensor,
-    # Square / Cube  (pow.Tensor_Scalar covers x**2, x**3, etc.)
+    torch.ops.aten.mul.Scalar,
+    # ── Square / Cube  (pow.Tensor_Scalar covers x**2, x**3, etc.) ───────────
     torch.ops.aten.pow.Tensor_Scalar,
-    # Div / Reciprocal
+    # ── Div / Reciprocal ──────────────────────────────────────────────────────
     torch.ops.aten.div.Tensor,
     torch.ops.aten.reciprocal.default,
-    # Sqrt
+    # ── Sqrt / Rsqrt ─────────────────────────────────────────────────────────
     torch.ops.aten.sqrt.default,
-    # Sin / Cos
+    torch.ops.aten.rsqrt.default,
+    # ── Trig / Exp / Log ─────────────────────────────────────────────────────
     torch.ops.aten.sin.default,
     torch.ops.aten.cos.default,
-    # Tanh
     torch.ops.aten.tanh.default,
-    # Log2
     torch.ops.aten.log2.default,
-    # Exp / Exp2
     torch.ops.aten.exp.default,
     torch.ops.aten.exp2.default,
-    # Max reduction (amax returns a plain tensor; aten.max returns a namedtuple)
+    torch.ops.aten.neg.default,
+    # ── Reductions ────────────────────────────────────────────────────────────
     torch.ops.aten.amax.default,
-    # Sum reduction
     torch.ops.aten.sum.default,
     torch.ops.aten.sum.dim_IntList,
+    torch.ops.aten.mean.dim,
+    # ── Fused composite ops (decomposed into VPU primitive sequences) ─────────
+    torch.ops.aten.native_layer_norm.default,   # SigLIP nn.LayerNorm
+    torch.ops.aten._softmax.default,            # all F.softmax / torch.softmax
+    torch.ops.aten.gelu.default,                # Gemma / SigLIP MLP activation
+    torch.ops.aten.silu.default,                # Pi0 time MLP
 })
 
 
 # ---------------------------------------------------------------------------
-# Thread-local state
+# Thread-local layer-tag stack
 # ---------------------------------------------------------------------------
 
-# Stack of Component tags set by component-boundary forward hooks.
-# Using a stack (not a scalar) so that nested component crossings are correct:
-#   entering paligemma → push LANGUAGE
-#     entering vision_tower → push VISION  (top = VISION)
-#   exiting  vision_tower  → pop         (top = LANGUAGE again)
-_vec_component_stack: threading.local = threading.local()
-
-# _in_quant_guard is imported from _dispatch_guards (shared with quant_linear)
+_vec_layer_stack: threading.local = threading.local()
 
 
-def _push_component(c: Component) -> None:
-    if not hasattr(_vec_component_stack, "stack"):
-        _vec_component_stack.stack = []
-    _vec_component_stack.stack.append(c)
+def _push_layer(comp: Component, tag: str) -> None:
+    if not hasattr(_vec_layer_stack, "stack"):
+        _vec_layer_stack.stack = []
+    _vec_layer_stack.stack.append((comp, tag))
 
 
-def _pop_component() -> None:
-    if hasattr(_vec_component_stack, "stack") and _vec_component_stack.stack:
-        _vec_component_stack.stack.pop()
+def _pop_layer() -> None:
+    if hasattr(_vec_layer_stack, "stack") and _vec_layer_stack.stack:
+        _vec_layer_stack.stack.pop()
 
 
-def _current_component() -> Optional[Component]:
-    if hasattr(_vec_component_stack, "stack") and _vec_component_stack.stack:
-        return _vec_component_stack.stack[-1]
-    return None
+def _current_layer() -> tuple[Component, str]:
+    """Returns (UNKNOWN, 'unattributed') when the stack is empty."""
+    if hasattr(_vec_layer_stack, "stack") and _vec_layer_stack.stack:
+        return _vec_layer_stack.stack[-1]
+    return (Component.UNKNOWN, "unattributed")
 
 
 # ---------------------------------------------------------------------------
-# Tensor argument helpers
+# Helpers for dimension-aware reductions (amax, sum, mean)
 # ---------------------------------------------------------------------------
 
-def _quant_val(v: object, fmt: QuantFormat) -> object:
-    """Recursively quantize floating-point tensors in a value; pass others through."""
-    if isinstance(v, torch.Tensor) and v.is_floating_point():
-        return quant(v.float(), fmt).to(v.dtype)
-    if isinstance(v, (list, tuple)):
-        result = [_quant_val(x, fmt) for x in v]
-        return type(v)(result)
-    return v
+def _reduce_with_dim(vrf, x_in: torch.Tensor, func, dim_arg, keepdim: bool) -> torch.Tensor:
+    """Apply a staged VPU row-reduction (rsum or rmax) over a single dim."""
+    is_max = (func is torch.ops.aten.amax.default)
+    reduce_fn = _vpu_rmax_all if is_max else _vpu_rsum_all
 
+    x_bf16 = x_in.bfloat16()
+    d = (dim_arg[0] if isinstance(dim_arg, (list, tuple)) else dim_arg)
+    if d < 0:
+        d = x_in.dim() + d
 
-def _quant_args(args: tuple, fmt: QuantFormat) -> tuple:
-    return tuple(_quant_val(a, fmt) for a in args)
-
-
-def _quant_output(out: object, fmt: QuantFormat) -> object:
-    return _quant_val(out, fmt)
+    # Bring target dim to last position for row-reduction
+    x_t = x_bf16.transpose(d, -1).contiguous()
+    result = reduce_fn(vrf, x_t)               # (..., 1) — last dim is the reduced one
+    result = result.transpose(d, -1).contiguous()
+    if not keepdim:
+        result = result.squeeze(d)
+    return result.to(x_in.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -162,65 +224,165 @@ def _quant_output(out: object, fmt: QuantFormat) -> object:
 
 class VectorQuantMode(TorchDispatchMode):
     """
-    Context manager that quantizes every target vector op to (vec_input_fmt, vec_output_fmt).
+    Context manager that routes every target vector op through VectorRTLFunctions
+    when functional_model is set, or passes through unchanged otherwise.
 
-    Only ops executing within an active component (as signalled by the
-    component-boundary hooks registered by patch_vector_ops) are quantized.
-    All other ops pass through unchanged.
+    All ops in TARGET_OPS are intercepted unconditionally — there is no
+    component gate.  Ops outside any hooked module (final RMSNorm, Euler step)
+    are labelled "unattributed" in the tracker output.
     """
 
     def __init__(
         self,
-        active_groups: set[QuantGroup],
-        vec_input_fmt: QuantFormat,
-        vec_output_fmt: QuantFormat,
         tracker: Optional[StatsTracker] = None,
+        functional_model=None,
+        verbose: bool = False,
+        estimated_total: int = 0,
     ) -> None:
         super().__init__()
-        self.active_comps  = _active_components(set(active_groups))
-        self.vec_input_fmt  = vec_input_fmt
-        self.vec_output_fmt = vec_output_fmt
-        self.tracker        = tracker
-        self._call_count    = 0
+        self.tracker          = tracker
+        self.functional_model = functional_model
+        self.verbose          = verbose
+        self._estimated_total = estimated_total
+        self._call_count      = 0
 
-    def __torch_dispatch__(self, op, types, args=(), kwargs=None):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
             kwargs = {}
 
-        # Re-entrant guard: quant() itself uses aten ops — don't recurse
+        # Re-entrant guard: VPU decompositions use aten ops internally
         if getattr(_in_quant_guard, "active", False):
-            return op(*args, **kwargs)
+            return func(*args, **kwargs)
 
         # Only intercept target vector ops
-        if op not in TARGET_OPS:
-            return op(*args, **kwargs)
+        if func not in TARGET_OPS:
+            return func(*args, **kwargs)
 
-        # Gate on active component
-        current_comp = _current_component()
-        if current_comp is None or current_comp not in self.active_comps:
-            return op(*args, **kwargs)
+        # Layer tag — labeling only, never gates
+        current_comp, layer_tag = _current_layer()
 
-        # Quantize inputs, run op, quantize output
-        _in_quant_guard.active = True
-        try:
-            q_args = _quant_args(args, self.vec_input_fmt)
-            out    = op(*q_args, **kwargs)
-            out_q  = _quant_output(out, self.vec_output_fmt)
+        # ── Functional model path ────────────────────────────────────────────
+        if self.functional_model is not None:
+            vrf = self.functional_model
+            _in_quant_guard.active = True
+            try:
+                out = self._dispatch_fm(func, args, kwargs, vrf)
 
-            if self.tracker is not None:
-                with torch.no_grad():
-                    out_fp = op(*args, **kwargs)
-                    self._call_count += 1
-                    self.tracker.record(
-                        name=f"vec.{op._overloadpacket._qualified_op_name}.{current_comp.value}.{self._call_count}",
-                        component=current_comp,
-                        y_fp=out_fp if isinstance(out_fp, torch.Tensor) else out_fp,
-                        y_quant=out_q if isinstance(out_q, torch.Tensor) else out_q,
-                    )
-        finally:
-            _in_quant_guard.active = False
+                if self.tracker is not None:
+                    # Reference output (guard is True so this bypasses dispatch)
+                    with torch.no_grad():
+                        y_ref = func(*args, **kwargs)
+                    y_ref_t = y_ref[0] if isinstance(y_ref, tuple) else y_ref
+                    out_t   = out[0]   if isinstance(out,   tuple) else out
+                    if isinstance(y_ref_t, torch.Tensor) and isinstance(out_t, torch.Tensor):
+                        self._call_count += 1
+                        op_name = getattr(
+                            getattr(func, "_overloadpacket", None),
+                            "_qualified_op_name",
+                            str(func),
+                        )
+                        self.tracker.record(
+                            name=f"vec.{layer_tag}.{op_name}.{self._call_count}",
+                            component=current_comp,
+                            y_fp=y_ref_t,
+                            y_quant=out_t,
+                        )
+                        if self.verbose:
+                            last = self.tracker.calls[-1]
+                            rmse = last["rmse"]
+                            total_str = f"/~{self._estimated_total}" if self._estimated_total else ""
+                            pct = (f"{100 * self._call_count // self._estimated_total:3d}%"
+                                   if self._estimated_total else "   ")
+                            op_short = op_name.split("::")[-1]
+                            shape = tuple(args[0].shape) if isinstance(args[0], torch.Tensor) else "?"
+                            print(
+                                f"[VEC | {self._call_count:5d}{total_str} | {pct}]"
+                                f"  {layer_tag:<20}  {op_short:<22}  in={shape}"
+                                f"  rmse={rmse:.6f}",
+                                flush=True,
+                            )
+            finally:
+                _in_quant_guard.active = False
+            return out
 
-        return out_q
+        # ── Passthrough (no FM) ───────────────────────────────────────────────
+        return func(*args, **kwargs)
+
+    # ------------------------------------------------------------------
+    def _dispatch_fm(self, func, args, kwargs, vrf):
+        """Route a single op through the VPU functional model."""
+
+        # ── Fused composite ops ──────────────────────────────────────────
+        if func is torch.ops.aten.native_layer_norm.default:
+            # args: (x, norm_shape, weight, bias, eps)
+            x, _, weight, bias, eps = args[0], args[1], args[2], args[3], args[4]
+            y = _vpu_layer_norm(vrf, x.bfloat16(), weight, bias, eps)
+            # native_layer_norm returns (output, mean, rstd); only output is used
+            return (y.to(x.dtype), None, None)
+
+        if func is torch.ops.aten._softmax.default:
+            # args: (x, dim, half_to_float)
+            x, dim = args[0], args[1]
+            y = _vpu_softmax(vrf, x.bfloat16(), dim)
+            return y.to(x.dtype)
+
+        if func is torch.ops.aten.gelu.default:
+            x = args[0]
+            return _vpu_gelu_tanh(vrf, x.bfloat16()).to(x.dtype)
+
+        if func is torch.ops.aten.silu.default:
+            x = args[0]
+            return _vpu_silu(vrf, x.bfloat16()).to(x.dtype)
+
+        if func is torch.ops.aten.rsqrt.default:
+            x = args[0]
+            return _vpu_rsqrt(vrf, x.bfloat16()).to(x.dtype)
+
+        # ── Dimension-aware reductions ────────────────────────────────────
+        if func is torch.ops.aten.mean.dim:
+            # args: (x, dim_list, keepdim[, dtype])
+            x_in     = args[0]
+            dim_list = args[1]
+            keepdim  = args[2] if len(args) > 2 else False
+            d = dim_list[0] if isinstance(dim_list, (list, tuple)) else dim_list
+            N = x_in.shape[d]
+            sum_out = _reduce_with_dim(vrf, x_in, torch.ops.aten.sum.dim_IntList, dim_list, keepdim)
+            inv_n   = torch.full_like(sum_out.bfloat16(), 1.0 / N)
+            return vrf.mul(sum_out.bfloat16(), inv_n).to(x_in.dtype)
+
+        if func is torch.ops.aten.amax.default:
+            x_in    = args[0]
+            dim_arg = args[1] if len(args) > 1 else None
+            keepdim = args[2] if len(args) > 2 else False
+            if dim_arg is None:
+                flat = _vpu_rmax_all(vrf, x_in.bfloat16().flatten().unsqueeze(0))
+                return flat.squeeze().to(x_in.dtype)
+            return _reduce_with_dim(vrf, x_in, func, dim_arg, keepdim)
+
+        if func is torch.ops.aten.sum.dim_IntList:
+            x_in    = args[0]
+            dim_arg = args[1]
+            keepdim = args[2] if len(args) > 2 else False
+            return _reduce_with_dim(vrf, x_in, func, dim_arg, keepdim)
+
+        if func is torch.ops.aten.sum.default:
+            x_in = args[0]
+            flat = _vpu_rsum_all(vrf, x_in.bfloat16().flatten().unsqueeze(0))
+            return flat.squeeze().to(x_in.dtype)
+
+        # ── Atomic pointwise ops via dispatch table ───────────────────────
+        if func not in _VEC_FM_DISPATCH:
+            return func(*args, **kwargs)
+
+        bf16_args = [
+            a.bfloat16() if isinstance(a, torch.Tensor) else a
+            for a in args
+        ]
+        method = _VEC_FM_DISPATCH[func]
+        out    = method(vrf, *bf16_args)
+        if isinstance(out, torch.Tensor):
+            out = out.to(args[0].dtype)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -230,66 +392,77 @@ class VectorQuantMode(TorchDispatchMode):
 def patch_vector_ops(
     model: torch.nn.Module,
     active_groups: set[QuantGroup],
-    vec_input_fmt: QuantFormat,
-    vec_output_fmt: QuantFormat,
     tracker: Optional[StatsTracker] = None,
-) -> tuple[list, VectorQuantMode]:
+    functional_model=None,
+    verbose: bool = False,
+    estimated_total: int = 0,
+) -> tuple[list, VectorQuantMode, dict]:
     """
-    Register component-boundary hooks for attribution and return a
-    (handles, VectorQuantMode) pair.
+    Register layer-tag hooks for attribution and return a
+    (handles, VectorQuantMode, hook_fires) triple.
 
-    The caller is responsible for entering VectorQuantMode as a context manager
-    around inference and removing hooks afterwards via unpatch_vector_ops.
+    Hooks push (Component, layer_tag) onto a thread-local stack so
+    __torch_dispatch__ can label each op.  All ops in TARGET_OPS are routed
+    through VRF unconditionally — there is no attribution gate.  Ops outside
+    any hook (final RMSNorm, Euler step) are labelled "unattributed".
 
     Args:
-        model:          Pi0Pytorch model (or any nn.Module).
-        active_groups:  Which QuantGroups to quantize.
-        vec_input_fmt:  Format applied to tensor inputs of each vector op.
-        vec_output_fmt: Format applied to each vector op's output.
-        tracker:        Optional StatsTracker.
+        model:            Pi0Pytorch model (or any nn.Module).
+        active_groups:    Which QuantGroups to register labeling hooks for.
+                          Does NOT gate VRF routing (all ops always go to VRF).
+        tracker:          Optional StatsTracker for RMSE recording.
+        functional_model: VectorRTLFunctions instance, or None for passthrough.
+        verbose:          If True, print one trace line per op to stdout.
+        estimated_total:  Estimated total vec-op count for % display in trace.
 
     Returns:
-        (handles, ctx) where handles is a list of hook handles and ctx is the
-        VectorQuantMode instance (not yet entered).
+        (handles, ctx, hook_fires) where:
+          handles    — list of hook handles (pass to unpatch_vector_ops)
+          ctx        — VectorQuantMode instance (enter as context manager)
+          hook_fires — dict[component_name, int] updated in-place by hooks
     """
-    active_groups = set(active_groups)
-    active_comps  = _active_components(active_groups)
     handles: list = []
-    n_hooks = 0
+    hook_fires: dict = defaultdict(int)
+    hooked: list[tuple[str, str, str]] = []  # (module_path, component, layer_tag)
 
     for name, mod in model.named_modules():
-        comp = _infer_component(name)
-        if comp == Component.UNKNOWN or comp not in active_comps:
+        result = _vec_layer_tag_for_module(name)
+        if result is None:
             continue
+        comp, tag = result
 
-        # Only hook at the top-level boundary for this component — i.e. the
-        # outermost module where the component tag first appears.  This avoids
-        # placing thousands of hooks on every sub-layer.
-        parent_name = ".".join(name.split(".")[:-1]) if "." in name else ""
-        parent_comp = _infer_component(parent_name)
-        if parent_comp == comp:
-            continue  # Inner module of same component — parent already hooks it
-
-        def _make_hooks(c: Component):
+        def _make_hooks(c: Component, t: str, fires: dict, cname: str):
             def pre(mod, inp):
-                _push_component(c)
+                _push_layer(c, t)
+                fires[cname] += 1
             def post(mod, inp, out):
-                _pop_component()
+                _pop_layer()
             return pre, post
 
-        pre_h, post_h = _make_hooks(comp)
+        pre_h, post_h = _make_hooks(comp, tag, hook_fires, comp.value)
         handles.append(mod.register_forward_pre_hook(pre_h))
         handles.append(mod.register_forward_hook(post_h))
-        n_hooks += 1
+        hooked.append((name, comp.value, tag))
 
-    ctx = VectorQuantMode(active_groups, vec_input_fmt, vec_output_fmt, tracker)
-
-    print(
-        f"[patch_vector_ops] Hooked {n_hooks} component-boundary modules "
-        f"for groups: {[g.value for g in active_groups]}  "
-        f"vec_input_fmt={vec_input_fmt.value}  vec_output_fmt={vec_output_fmt.value}"
+    ctx = VectorQuantMode(
+        tracker=tracker,
+        functional_model=functional_model,
+        verbose=verbose,
+        estimated_total=estimated_total,
     )
-    return handles, ctx
+
+    fm_label = (
+        type(functional_model).__name__ if functional_model is not None else "passthrough"
+    )
+    print(f"\n[patch_vector_ops] functional_model={fm_label}  verbose={verbose}")
+    print(f"  {'module':<60}  {'component':<14}  layer_tag")
+    print(f"  {'-'*60}  {'-'*14}  ---------")
+    for mod_path, comp_name, tag in hooked:
+        print(f"  {mod_path:<60}  {comp_name:<14}  {tag}")
+    if not hooked:
+        print("  (no modules hooked — check _vec_layer_tag_for_module vs model structure)")
+    print()
+    return handles, ctx, hook_fires
 
 
 def unpatch_vector_ops(handles: list) -> None:

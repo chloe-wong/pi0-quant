@@ -80,6 +80,8 @@ from .quant_linear import QuantLinear
 from .rel_noise import NoiseMode
 from .quant_types import QuantFormat, quant
 from .stats_tracker import Component, StatsTracker
+from ._dispatch_guards import _in_quant_guard
+from .hw_float_ops import quantize_bf16_to_e4m3
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +189,8 @@ def patch_model(
     noise_injection: float = 0.0,
     noise_mode: NoiseMode = NoiseMode.UNIFORM,
     verbose: bool = False,
+    trace: bool = False,
+    estimated_total: int = 0,
 ) -> nn.Module:
     """
     Replace every nn.Linear in `model` with a QuantLinear in-place.
@@ -266,6 +270,8 @@ def patch_model(
             reference_store=reference_store,
             matmul_io_store=matmul_io_store,
             ref_input_store=ref_input_store,
+            trace=trace,
+            estimated_total=estimated_total,
         )
 
         # Pre-register with tracker so summary() works even if some layers
@@ -394,8 +400,6 @@ class QuantConv2d(nn.Conv2d):
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from .quant_types import quant as _quant
-        from ._dispatch_guards import _in_quant_guard
         w = self.weight
         b = self.bias
 
@@ -412,10 +416,25 @@ class QuantConv2d(nn.Conv2d):
             x_flat = x_col.permute(0, 2, 1).reshape(B * out_H * out_W, -1).to(w.dtype)
             w_flat = w.reshape(self.out_channels, -1)  # [C_out, C_in*kH*kW]
 
-            y_out = self.functional_model(x_flat, w_flat, b).to(dtype=w.dtype, device=x.device)
+            # Po2 pre-normalization — same pipeline as QuantLinear FM path.
+            _in_quant_guard.active = True
+            try:
+                x_fp8, sx = quantize_bf16_to_e4m3(x_flat)
+                w_fp8, sw = quantize_bf16_to_e4m3(w_flat)
+            finally:
+                _in_quant_guard.active = False
+
+            x_norm = x_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+            w_norm = w_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+
+            y_unscaled = self.functional_model(x_norm, w_norm, None)
+            scale = 2.0 ** (sx + sw)
             # y_out: [B*out_H*out_W, C_out] → [B, C_out, out_H, out_W]
+            y_out = (y_unscaled * scale).to(dtype=w.dtype, device=x.device)
             y_out = y_out.reshape(B, out_H * out_W, self.out_channels).permute(0, 2, 1)
             y_out = y_out.reshape(B, self.out_channels, out_H, out_W)
+            if b is not None:
+                y_out = y_out + b.view(1, -1, 1, 1).to(dtype=w.dtype, device=x.device)
 
             if self.tracker is not None:
                 _in_quant_guard.active = True
@@ -436,30 +455,23 @@ class QuantConv2d(nn.Conv2d):
 
             return y_out
 
-        else:
-            # ── Format-flag path ─────────────────────────────────────────────
-            # Cast x to weight dtype so passthrough (BF16/BF16) gives 0 RMSE.
-            # Image inputs arrive as float32; conv weights are BF16.
-            x = x.to(w.dtype)
-            x_q = _quant(x.float(), self.mx_input_fmt).to(w.dtype)
-            w_q = _quant(w.float(), self.mx_input_fmt).to(w.dtype)
-            y   = F.conv2d(x_q, w_q, b, self.stride, self.padding, self.dilation, self.groups)
-            y_q = _quant(y.float(), self.mx_output_fmt).to(w.dtype)
+        # ── Passthrough ───────────────────────────────────────────────────────
+        x = x.to(w.dtype)
+        y_out = F.conv2d(x, w, b, self.stride, self.padding, self.dilation, self.groups)
 
-            if self.tracker is not None:
-                with torch.no_grad():
-                    y_fp = F.conv2d(x, w, b, self.stride, self.padding, self.dilation, self.groups)
-                    y_clean_ref = (self.reference_store.get(self.layer_name)
-                                   if self.reference_store is not None else None)
-                    self.tracker.record(
-                        name=self.layer_name,
-                        component=self.component,
-                        y_fp=y_fp,
-                        y_quant=y_q,
-                        y_clean_ref=y_clean_ref,
-                    )
+        if self.tracker is not None:
+            with torch.no_grad():
+                y_clean_ref = (self.reference_store.get(self.layer_name)
+                               if self.reference_store is not None else None)
+                self.tracker.record(
+                    name=self.layer_name,
+                    component=self.component,
+                    y_fp=y_out,
+                    y_quant=y_out,
+                    y_clean_ref=y_clean_ref,
+                )
 
-            return y_q
+        return y_out
 
 
 def patch_conv2d(
@@ -646,29 +658,22 @@ _attn_component_local: threading.local = threading.local()
 def patch_attn_sdpa(
     model: nn.Module,
     active_groups: set[QuantGroup],
-    mx_input_fmt: QuantFormat,
-    mx_output_fmt: QuantFormat,
     tracker: Optional[StatsTracker] = None,
     functional_model_factory=None,
     reference_store=None,
 ) -> list:
     """
     Patch F.scaled_dot_product_attention to simulate attention score matmuls
-    (Q@K^T and attn_weights@V) with either format-flag quantization or a
-    functional model (IPT/SA).
+    (Q@K^T and attn_weights@V) with the functional model (IPT/SA).
 
-    The fused SDPA kernel is replaced with an explicit unfused implementation:
-      1. Q, K, V quantized to mx_input_fmt  (format-flag) or passed through
-         (functional model quantizes internally to E4M3)
-      2. scores  = Q @ K^T * scale          (batched matmul or FM loop)
-      3. scores += attn_mask / causal mask
-      4. attn_weights = softmax(scores)      in BF16
-      5. attn_weights quantized to FP8 (E4M3, po2 scaling) — always
-      6. out = attn_weights @ V              (batched matmul or FM loop)
-      7. out quantized to mx_output_fmt      (format-flag only)
+    The fused SDPA kernel is replaced with an explicit unfused loop over heads:
+      1. Q, K po2-quantized to E4M3 → FM computes Q@K^T → rescaled scores
+      2. scores += attn_mask / causal mask
+      3. attn_weights = softmax(scores) in BF16
+      4. attn_weights, V po2-quantized to E4M3 → FM computes attn_w@V → rescaled output
 
-    Functional model path loops over (batch, head) since FM interface is 2D.
-    Format-flag path uses batched torch.matmul — no loop needed.
+    When functional_model_factory is None, SDPA calls for active components
+    are passed through to the original kernel unchanged.
 
     Works by registering pre/post forward hooks on every self_attn module in
     the active groups so the patched SDPA knows which component is executing.
@@ -676,11 +681,9 @@ def patch_attn_sdpa(
     Args:
         model:                    The Pi0Pytorch model.
         active_groups:            Groups whose SDPA calls should be quantized.
-        mx_input_fmt:             Format for Q, K, V (format-flag path only).
-        mx_output_fmt:            Format for the output (format-flag path only).
         tracker:                  Optional StatsTracker.
-        functional_model_factory: If set, uses FM for Q@K^T and attn_weights@V.
-                                  mx_input_fmt and mx_output_fmt are ignored.
+        functional_model_factory: FM factory (in_features, out_features) -> model.
+                                  Required for quantized attention.
 
     Returns:
         List of hook handles — pass to unpatch_attn_sdpa() to clean up.
@@ -743,66 +746,62 @@ def patch_attn_sdpa(
         head_dim = query.size(-1)
         _scale = scale if scale is not None else (1.0 / _math.sqrt(head_dim))
 
-        if fm_qk is not None:
-            # ── Functional model path: loop over heads (B=1 at inference) ───
-            H, Sq, D = query.shape[1], query.shape[2], query.shape[3]
-            Skv = key.size(2)
-            Dv  = value.size(3)
-            y_out = torch.zeros(1, H, Sq, Dv, dtype=torch.bfloat16, device=query.device)
+        if fm_qk is None:
+            return _orig_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale)
 
-            for h in range(H):
-                    q_bh = query[0, h].to(torch.bfloat16)   # [Sq,  D]
-                    k_bh = key[0, h].to(torch.bfloat16)     # [Skv, D]
-                    v_bh = value[0, h].to(torch.bfloat16)   # [Skv, Dv]
+        # ── Functional model path: loop over heads (B=1 at inference) ────────
+        H, Sq, D = query.shape[1], query.shape[2], query.shape[3]
+        Skv = key.size(2)
+        Dv  = value.size(3)
+        y_out = torch.zeros(1, H, Sq, Dv, dtype=torch.bfloat16, device=query.device)
 
-                    # Step 4: Q @ K^T via FM  →  fm(Q, K, None) = Q @ K^T
-                    scores = fm_qk(q_bh, k_bh, None).to(
-                        dtype=torch.bfloat16, device=query.device
-                    ) * _scale  # [Sq, Skv]
+        for h in range(H):
+            q_bh = query[0, h].to(torch.bfloat16)   # [Sq,  D]
+            k_bh = key[0, h].to(torch.bfloat16)     # [Skv, D]
+            v_bh = value[0, h].to(torch.bfloat16)   # [Skv, Dv]
 
-                    # Step 5: mask
-                    mask_bh = None
-                    if attn_mask is not None:
-                        if attn_mask.dim() == 4:
-                            h_idx = h if attn_mask.shape[1] > 1 else 0
-                            mask_bh = attn_mask[0, h_idx]
-                        else:
-                            mask_bh = attn_mask
-                    scores = _apply_mask(scores, mask_bh, is_causal)
-
-                    # Step 6: softmax in BF16, quantize output to FP8
-                    attn_w = torch.softmax(scores, dim=-1)
-                    attn_w = quant(attn_w.float(), QuantFormat.FLOAT8_E4M3).to(torch.bfloat16)
-
-                    # Step 7: attn_weights @ V via FM
-                    # fm(x, w, None) = x @ w^T; pass v_bh.T so result = attn_w @ v_bh
-                    out_bh = fm_av(attn_w, v_bh.T.contiguous(), None).to(
-                        dtype=torch.bfloat16, device=query.device
-                    )  # [Sq, Dv]
-                    y_out[0, h] = out_bh
-
-            y_out = y_out.to(query.dtype)
-
-        else:
-            # ── Format-flag path: batched torch.matmul ───────────────────────
-            dtype = query.dtype
-            q_q = quant(query.float(), mx_input_fmt).to(dtype)
-            k_q = quant(key.float(),   mx_input_fmt).to(dtype)
-            v_q = quant(value.float(), mx_input_fmt).to(dtype)
-
-            # Step 4: Q @ K^T
-            scores = torch.matmul(q_q, k_q.transpose(-2, -1)) * _scale
+            # Step 4: Q @ K^T — po2 quantize → normalize → FM → rescale
+            _in_quant_guard.active = True
+            try:
+                q_fp8, sq = quantize_bf16_to_e4m3(q_bh)
+                k_fp8, sk = quantize_bf16_to_e4m3(k_bh)
+            finally:
+                _in_quant_guard.active = False
+            q_norm = q_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+            k_norm = k_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+            scores = (fm_qk(q_norm, k_norm, None) * (2.0 ** (sq + sk)) * _scale).to(
+                dtype=torch.bfloat16, device=query.device
+            )  # [Sq, Skv]
 
             # Step 5: mask
-            scores = _apply_mask(scores, attn_mask, is_causal)
+            mask_bh = None
+            if attn_mask is not None:
+                if attn_mask.dim() == 4:
+                    h_idx = h if attn_mask.shape[1] > 1 else 0
+                    mask_bh = attn_mask[0, h_idx]
+                else:
+                    mask_bh = attn_mask
+            scores = _apply_mask(scores, mask_bh, is_causal)
 
-            # Step 6: softmax in BF16, quantize to FP8
-            attn_w = torch.softmax(scores.to(torch.bfloat16), dim=-1)
-            attn_w = quant(attn_w.float(), QuantFormat.FLOAT8_E4M3).to(torch.bfloat16)
+            # Step 6: softmax in BF16, po2 quantize to E4M3
+            attn_w = torch.softmax(scores, dim=-1)
+            _in_quant_guard.active = True
+            try:
+                attn_w_fp8, satw = quantize_bf16_to_e4m3(attn_w)
+                v_fp8, sv = quantize_bf16_to_e4m3(v_bh)
+            finally:
+                _in_quant_guard.active = False
+            attn_w_norm = attn_w_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+            v_norm = v_fp8.view(torch.float8_e4m3fn).to(torch.float32)
 
-            # Step 7: attn_weights @ V
-            y_out = torch.matmul(attn_w, v_q.to(torch.bfloat16))
-            y_out = quant(y_out.float(), mx_output_fmt).to(dtype)
+            # Step 7: attn_weights @ V via FM → rescale
+            # fm(x, w, None) = x @ w^T; pass v_norm.T so result = attn_w_norm @ v_norm
+            out_bh = (fm_av(attn_w_norm, v_norm.T.contiguous(), None) * (2.0 ** (satw + sv))).to(
+                dtype=torch.bfloat16, device=query.device
+            )  # [Sq, Dv]
+            y_out[0, h] = out_bh
+
+        y_out = y_out.to(query.dtype)
 
         if tracker is not None:
             with torch.no_grad():
@@ -826,9 +825,7 @@ def patch_attn_sdpa(
     F.scaled_dot_product_attention = _quant_sdpa
 
     n_modules = len(handles) // 2
-    mode = (f"functional_model={functional_model_factory}"
-            if functional_model_factory else
-            f"mx_input_fmt={mx_input_fmt.value}  mx_output_fmt={mx_output_fmt.value}")
+    mode = f"functional_model={functional_model_factory}" if functional_model_factory else "passthrough"
     print(
         f"[patch_attn_sdpa] Hooked {n_modules} self_attn modules "
         f"for groups: {[g.value for g in active_groups]}  {mode}"
@@ -858,16 +855,13 @@ _orig_eager_attn_forward = None
 def patch_attn_eager(
     model: nn.Module,
     active_groups: set[QuantGroup],
-    mx_input_fmt: QuantFormat,
-    mx_output_fmt: QuantFormat,
     tracker: Optional[StatsTracker] = None,
     functional_model_factory=None,
     reference_store=None,
 ) -> None:
     """
     Patch modeling_gemma.eager_attention_forward to simulate Gemma attention
-    score matmuls (Q@K^T and attn_weights@V) with either format-flag
-    quantization or a functional model (IPT/SA).
+    score matmuls (Q@K^T and attn_weights@V) with the functional model (IPT/SA).
 
     Covers all three Gemma attention paths in Pi0:
       - language-only layers (paligemma.language_model)
@@ -880,13 +874,12 @@ def patch_attn_eager(
 
     The patched implementation:
       1. repeat_kv on K, V (done inside original; must be done explicitly here)
-      2. Q @ K^T  (FM loop over heads, or batched torch.matmul with quant Q/K)
+      2. Q, K po2-quantized → FM computes Q@K^T → rescaled scores
       3. Scale + attention_mask
       4. Softmax in BF16
-      5. FP8 (E4M3, po2 scaling) quantization of attn_weights
-      6. attn_weights @ V  (FM or batched matmul)
-      7. (format-flag only) quantize output to mx_output_fmt
+      5. attn_weights, V po2-quantized → FM computes attn_w@V → rescaled output
 
+    When functional_model_factory is None, passes through to the original.
     Returns None (no hook handles — restored via unpatch_attn_eager).
     """
     global _orig_eager_attn_forward
@@ -935,58 +928,58 @@ def patch_attn_eager(
         # key_states:   [B, H,  Skv, D]
         # value_states: [B, H,  Skv, Dv]
 
-        if fm_qk is not None:
-            # ── Functional model path: loop over (batch, head) ───────────────
-            B, H, Sq, D = query.shape
-            Skv = key_states.size(2)
-            Dv  = value_states.size(3)
-            y_out = torch.zeros(B, H, Sq, Dv, dtype=torch.bfloat16, device=query.device)
+        if fm_qk is None:
+            return _orig(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
 
-            for b in range(B):
-                # attention_mask is [B, 1, Sq, Skv] (broadcast over heads) or [B, H, Sq, Skv]
-                mask_b = attention_mask[b] if attention_mask is not None else None
-                for h in range(H):
-                    q_bh = query[b, h].to(torch.bfloat16)         # [Sq, D]
-                    k_bh = key_states[b, h].to(torch.bfloat16)    # [Skv, D]
-                    v_bh = value_states[b, h].to(torch.bfloat16)  # [Skv, Dv]
+        # ── Functional model path: loop over (batch, head) ───────────────────
+        B, H, Sq, D = query.shape
+        Skv = key_states.size(2)
+        Dv  = value_states.size(3)
+        y_out = torch.zeros(B, H, Sq, Dv, dtype=torch.bfloat16, device=query.device)
 
-                    # Q @ K^T via FM: fm(Q, K, None) = Q @ K^T   [Sq, Skv]
-                    scores = fm_qk(q_bh, k_bh, None).to(
-                        dtype=torch.bfloat16, device=query.device
-                    ) * scaling
+        for b in range(B):
+            # attention_mask is [B, 1, Sq, Skv] (broadcast over heads) or [B, H, Sq, Skv]
+            mask_b = attention_mask[b] if attention_mask is not None else None
+            for h in range(H):
+                q_bh = query[b, h].to(torch.bfloat16)         # [Sq, D]
+                k_bh = key_states[b, h].to(torch.bfloat16)    # [Skv, D]
+                v_bh = value_states[b, h].to(torch.bfloat16)  # [Skv, Dv]
 
-                    if mask_b is not None:
-                        h_idx = h if mask_b.shape[0] > 1 else 0
-                        scores = scores + mask_b[h_idx, :Sq, :Skv]
+                # Q @ K^T — po2 quantize → normalize → FM → rescale
+                _in_quant_guard.active = True
+                try:
+                    q_fp8, sq = quantize_bf16_to_e4m3(q_bh)
+                    k_fp8, sk = quantize_bf16_to_e4m3(k_bh)
+                finally:
+                    _in_quant_guard.active = False
+                q_norm = q_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+                k_norm = k_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+                scores = (fm_qk(q_norm, k_norm, None) * (2.0 ** (sq + sk)) * scaling).to(
+                    dtype=torch.bfloat16, device=query.device
+                )
 
-                    attn_w = torch.softmax(scores, dim=-1)
-                    attn_w = quant(attn_w.float(), QuantFormat.FLOAT8_E4M3).to(torch.bfloat16)
+                if mask_b is not None:
+                    h_idx = h if mask_b.shape[0] > 1 else 0
+                    scores = scores + mask_b[h_idx, :Sq, :Skv]
 
-                    # attn_w @ V via FM: fm(attn_w, V^T, None) = attn_w @ V  [Sq, Dv]
-                    out_bh = fm_av(attn_w, v_bh.T.contiguous(), None).to(
-                        dtype=torch.bfloat16, device=query.device
-                    )
-                    y_out[b, h] = out_bh
+                attn_w = torch.softmax(scores, dim=-1)
 
-            y_out = y_out.to(query.dtype)
+                # attn_w @ V — po2 quantize → normalize → FM → rescale
+                _in_quant_guard.active = True
+                try:
+                    attn_w_fp8, satw = quantize_bf16_to_e4m3(attn_w)
+                    v_fp8, sv = quantize_bf16_to_e4m3(v_bh)
+                finally:
+                    _in_quant_guard.active = False
+                attn_w_norm = attn_w_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+                v_norm = v_fp8.view(torch.float8_e4m3fn).to(torch.float32)
 
-        else:
-            # ── Format-flag path: batched torch.matmul ───────────────────────
-            dtype = query.dtype
-            q_q = quant(query.float(), mx_input_fmt).to(dtype)
-            k_q = quant(key_states.float(), mx_input_fmt).to(dtype)
-            v_q = quant(value_states.float(), mx_input_fmt).to(dtype)
+                out_bh = (fm_av(attn_w_norm, v_norm.T.contiguous(), None) * (2.0 ** (satw + sv))).to(
+                    dtype=torch.bfloat16, device=query.device
+                )
+                y_out[b, h] = out_bh
 
-            scores = torch.matmul(q_q, k_q.transpose(-2, -1)) * scaling
-
-            if attention_mask is not None:
-                scores = scores + attention_mask[:, :, :, :key_states.shape[-2]]
-
-            attn_w = torch.softmax(scores.to(torch.bfloat16), dim=-1)
-            attn_w = quant(attn_w.float(), QuantFormat.FLOAT8_E4M3).to(torch.bfloat16)
-
-            y_out = torch.matmul(attn_w, v_q.to(torch.bfloat16))
-            y_out = quant(y_out.float(), mx_output_fmt).to(dtype)
+        y_out = y_out.to(query.dtype)
 
         y_out_t = y_out.transpose(1, 2).contiguous()  # [B, Sq, H, Dv]
 
@@ -1013,9 +1006,7 @@ def patch_attn_eager(
 
     modeling_gemma.eager_attention_forward = _quant_eager_attn
 
-    mode = (f"functional_model={functional_model_factory}"
-            if functional_model_factory else
-            f"mx_input_fmt={mx_input_fmt.value}  mx_output_fmt={mx_output_fmt.value}")
+    mode = f"functional_model={functional_model_factory}" if functional_model_factory else "passthrough"
     print(
         f"[patch_attn_eager] Patched eager_attention_forward for "
         f"{len(module_to_comp)} self_attn modules "
@@ -1032,6 +1023,166 @@ def unpatch_attn_eager() -> None:
     modeling_gemma.eager_attention_forward = _orig_eager_attn_forward
     _orig_eager_attn_forward = None
     print("[unpatch_attn_eager] Restored original eager_attention_forward.")
+
+
+# ---------------------------------------------------------------------------
+# SigLIP attention patching (eager_attention_forward in modeling_siglip)
+# ---------------------------------------------------------------------------
+
+_orig_siglip_eager_attn_forward = None
+
+
+def patch_attn_siglip_eager(
+    model: nn.Module,
+    active_groups: set[QuantGroup],
+    tracker: Optional[StatsTracker] = None,
+    functional_model_factory=None,
+    reference_store=None,
+) -> None:
+    """
+    Patch transformers.models.siglip.modeling_siglip.eager_attention_forward to
+    simulate SigLIP ViT attention score matmuls (Q@K^T and attn_weights@V) with
+    the functional model (IPT/SA).
+
+    SigLIP uses its own eager_attention_forward (not SDPA, not Gemma's), so
+    patch_attn_sdpa and patch_attn_eager both miss it. This function plugs
+    the gap.
+
+    The patched implementation:
+      1. Q, K po2-quantized → FM computes Q@K^T → rescaled scores
+      2. Scale + attention_mask
+      3. Softmax in float32, cast to query.dtype
+      4. attn_weights, V po2-quantized → FM computes attn_w@V → rescaled output
+
+    When functional_model_factory is None, passes through to the original.
+    Returns None (restored via unpatch_attn_siglip_eager).
+    """
+    global _orig_siglip_eager_attn_forward
+
+    from transformers.models.siglip import modeling_siglip
+
+    active_groups = set(active_groups)
+    active_comps  = _active_components(active_groups)
+
+    # Build id(self_attn_module) → Component for SigLIP attention modules.
+    module_to_comp: dict[int, Component] = {}
+    for name, module in model.named_modules():
+        if name.split(".")[-1] != "self_attn":
+            continue
+        comp = _infer_component(name)
+        if comp not in active_comps:
+            continue
+        # Only SigLIP attention modules (check class name to avoid Gemma)
+        if "Siglip" not in type(module).__name__:
+            continue
+        module_to_comp[id(module)] = comp
+
+    fm_qk = functional_model_factory(0, 0) if functional_model_factory is not None else None
+    fm_av = functional_model_factory(0, 0) if functional_model_factory is not None else None
+
+    call_count = [0]
+    _orig = modeling_siglip.eager_attention_forward
+    _orig_siglip_eager_attn_forward = _orig
+
+    def _quant_siglip_eager_attn(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        dropout=0.0,
+        **kwargs,
+    ):
+        comp = module_to_comp.get(id(module))
+        if comp is None:
+            return _orig(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+
+        if fm_qk is None:
+            return _orig(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+
+        # ── Functional model path: loop over (batch, head) ───────────────────
+        # query/key/value: [B, H, Sq, D]  (SigLIP self-attention, Sq=Skv, no GQA)
+        B, H, Sq, D = query.shape
+        y_out = torch.zeros(B, H, Sq, D, dtype=torch.bfloat16, device=query.device)
+
+        for b in range(B):
+            mask_b = attention_mask[b] if attention_mask is not None else None
+            for h in range(H):
+                q_bh = query[b, h].to(torch.bfloat16)   # [Sq, D]
+                k_bh = key[b, h].to(torch.bfloat16)     # [Sq, D]
+                v_bh = value[b, h].to(torch.bfloat16)   # [Sq, D]
+
+                # Q @ K^T — po2 quantize → normalize → FM → rescale
+                _in_quant_guard.active = True
+                try:
+                    q_fp8, sq = quantize_bf16_to_e4m3(q_bh)
+                    k_fp8, sk = quantize_bf16_to_e4m3(k_bh)
+                finally:
+                    _in_quant_guard.active = False
+                q_norm = q_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+                k_norm = k_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+                scores = (fm_qk(q_norm, k_norm, None) * (2.0 ** (sq + sk)) * scaling).to(
+                    dtype=torch.bfloat16, device=query.device
+                )
+
+                if mask_b is not None:
+                    h_idx = h if mask_b.shape[0] > 1 else 0
+                    scores = scores + mask_b[h_idx]
+
+                # Softmax in float32, cast back (matches original SigLIP behavior)
+                attn_w = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+
+                # attn_w @ V — po2 quantize → normalize → FM → rescale
+                _in_quant_guard.active = True
+                try:
+                    attn_w_fp8, satw = quantize_bf16_to_e4m3(attn_w)
+                    v_fp8, sv = quantize_bf16_to_e4m3(v_bh)
+                finally:
+                    _in_quant_guard.active = False
+                attn_w_norm = attn_w_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+                v_norm = v_fp8.view(torch.float8_e4m3fn).to(torch.float32)
+
+                out_bh = (fm_av(attn_w_norm, v_norm.T.contiguous(), None) * (2.0 ** (satw + sv))).to(
+                    dtype=torch.bfloat16, device=query.device
+                )
+                y_out[b, h] = out_bh
+
+        y_out = y_out.to(query.dtype)
+        y_out_t = y_out.transpose(1, 2).contiguous()  # [B, Sq, H, D]
+
+        if tracker is not None:
+            with torch.no_grad():
+                ref_out, _ = _orig(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+                call_count[0] += 1
+                tracker.record(
+                    name=f"siglip_attn.{comp.value}.{call_count[0]}",
+                    component=comp,
+                    y_fp=ref_out,
+                    y_quant=y_out_t,
+                )
+
+        return y_out_t, None
+
+    modeling_siglip.eager_attention_forward = _quant_siglip_eager_attn
+
+    mode = f"functional_model={functional_model_factory}" if functional_model_factory else "passthrough"
+    print(
+        f"[patch_attn_siglip_eager] Patched siglip eager_attention_forward for "
+        f"{len(module_to_comp)} self_attn modules "
+        f"in groups: {[g.value for g in active_groups]}  {mode}"
+    )
+
+
+def unpatch_attn_siglip_eager() -> None:
+    """Restore the original modeling_siglip.eager_attention_forward."""
+    global _orig_siglip_eager_attn_forward
+    if _orig_siglip_eager_attn_forward is None:
+        return
+    from transformers.models.siglip import modeling_siglip
+    modeling_siglip.eager_attention_forward = _orig_siglip_eager_attn_forward
+    _orig_siglip_eager_attn_forward = None
+    print("[unpatch_attn_siglip_eager] Restored original siglip eager_attention_forward.")
 
 
 class QuantAttnContext:

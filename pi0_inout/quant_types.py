@@ -4,16 +4,10 @@ quant_types.py
 Quantization format definitions for the four formats under test:
 BF16 (baseline), FP16, FP8-E4M3, FP8-E5M2.
 
-Two FP8 scaling modes are supported (selected via set_fp8_mode):
-
-  "po2"     (default) — per-tensor power-of-two scaling.
-      scale = largest power-of-two <= max(|x|) / fp8_max_po2
-      Same per-tensor scope as "scaled", but the scale is constrained to a
-      power of two so that hardware can implement it as a pure exponent shift.
-
-  "scaled"            — per-tensor absmax scaling.
-      scale = max(|x|) / fp8_max          (any float value)
-      Matches NVIDIA Transformer Engine behavior.
+FP8 uses per-tensor power-of-two (po2) scaling exclusively:
+    scale = 2^floor(log2(max(|x|) / fp8_max_po2))
+This is hardware-compatible (pure exponent shift, no float multiply).
+Scale computation and BF16→E4M3 rounding are centralised in hw_float_ops.py.
 
 BFLOAT16 is the baseline (native model dtype): a bf16->bf16 round-trip is
 a no-op for bf16 weights/activations, giving zero quantization RMSE.
@@ -31,6 +25,8 @@ from __future__ import annotations
 import math
 import torch
 from enum import Enum
+
+from .hw_float_ops import quantize_bf16_to_e4m3
 
 
 # ---------------------------------------------------------------------------
@@ -74,43 +70,39 @@ _FP8_MAX: dict[QuantFormat, float] = {
     QuantFormat.FLOAT8_E5M2: 57344.0,
 }
 
-# Largest power-of-two representable in each element type.
-# Used by "po2" mode to compute the per-tensor power-of-two scale.
-# E4M3: max finite = 448 = 1.75 * 2^8, so largest po2 = 2^8 = 256
-# E5M2: max finite = 57344 = 1.75 * 2^15, so largest po2 = 2^15 = 32768
+# Largest power-of-two ≤ max finite value; used for E5M2 po2 scale.
+# E4M3: scale handled via hw_float_ops.quantize_bf16_to_e4m3 (centralised).
+# E5M2: max finite = 57344 = 1.75 * 2^15, largest po2 = 2^15 = 32768
 _FP8_MAX_PO2: dict[QuantFormat, float] = {
-    QuantFormat.FLOAT8_E4M3: 256.0,    # 2^8
+    QuantFormat.FLOAT8_E4M3: 256.0,    # 2^8  — kept for reference; E4M3 uses hw_float_ops
     QuantFormat.FLOAT8_E5M2: 32768.0,  # 2^15
 }
 
-# Minimum normal (non-subnormal) magnitude for each FP8 format.
-# Hardware flushes denormals to zero (DAZ); we replicate that after the fp8 round-trip.
+# Minimum normal magnitude: hardware flushes FP8 subnormals to zero (DAZ).
 # E4M3 (bias=7):  emin = 1-7 = -6  → min_normal = 2^-6
 # E5M2 (bias=15): emin = 1-15 = -14 → min_normal = 2^-14
 _FP8_MIN_NORMAL: dict[QuantFormat, float] = {
-    QuantFormat.FLOAT8_E4M3: 2.0 ** -6,   # 0.015625
-    QuantFormat.FLOAT8_E5M2: 2.0 ** -14,  # ~6.1e-5
+    QuantFormat.FLOAT8_E4M3: 2.0 ** -6,    # 0.015625
+    QuantFormat.FLOAT8_E5M2: 2.0 ** -14,   # ~6.1e-5
 }
 
 
 # ---------------------------------------------------------------------------
-# FP8 scaling mode (module-level state)
+# FP8 scaling mode — po2 only
 # ---------------------------------------------------------------------------
 
-_fp8_mode: str = "po2"  # one of: "po2", "scaled"
-
-
 def set_fp8_mode(mode: str) -> None:
-    """Set the FP8 quantization mode: 'po2' or 'scaled'."""
-    global _fp8_mode
-    if mode not in ("po2", "scaled"):
-        raise ValueError(f"Unknown FP8 mode: {mode!r}. Must be 'po2' or 'scaled'.")
-    _fp8_mode = mode
+    """Accept 'po2' only.  'scaled' mode has been removed; hardware uses po2."""
+    if mode != "po2":
+        raise ValueError(
+            f"Only 'po2' FP8 mode is supported (hardware-compatible power-of-two "
+            f"scaling).  'scaled' mode has been removed.  Got: {mode!r}"
+        )
 
 
 def get_fp8_mode() -> str:
-    """Return the current FP8 quantization mode ('po2' or 'scaled')."""
-    return _fp8_mode
+    """Always returns 'po2' — the only supported mode."""
+    return "po2"
 
 
 # ---------------------------------------------------------------------------
@@ -123,112 +115,76 @@ def quant(x: torch.Tensor, fmt: QuantFormat) -> torch.Tensor:
 
     For PASSTHROUGH: returns x unchanged (true no-op, any dtype).
     For BFLOAT16/FLOAT16: round-trip cast (no-op for bf16 models at baseline).
-    For FP8: per-tensor scaling using the current mode (set via set_fp8_mode).
+    For FP8-E4M3: hardware-faithful po2 scaling + BF16→E4M3 RNE rounding
+                  via hw_float_ops.quantize_bf16_to_e4m3.
+    For FP8-E5M2: po2 scaling via PyTorch cast (E5M2 rounding not yet ported).
     """
     if fmt is QuantFormat.PASSTHROUGH:
         return x
 
-    if fmt in _FP8_FORMATS:
-        if _fp8_mode == "po2":
-            return _quant_fp8_po2(x, fmt)
-        else:  # "scaled"
-            return _quant_fp8_scaled(x, fmt)
+    if fmt is QuantFormat.FLOAT8_E4M3:
+        return _quant_fp8_e4m3(x)
+
+    if fmt is QuantFormat.FLOAT8_E5M2:
+        return _quant_fp8_e5m2(x)
 
     target = TORCH_DTYPE[fmt]
     return x.float().to(target).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------
-# Mode 1: Per-tensor power-of-two scaling (default)
+# E4M3: delegates to hw_float_ops (centralised scale + rounding)
 # ---------------------------------------------------------------------------
 
-def _quant_fp8_po2(x: torch.Tensor, fmt: QuantFormat) -> torch.Tensor:
+def _quant_fp8_e4m3(x: torch.Tensor) -> torch.Tensor:
     """
-    Per-tensor power-of-two scaling.
+    Per-tensor po2 scaling + hardware-faithful BF16→E4M3 RNE rounding.
 
-    The scale is constrained to a power of two so hardware can implement
-    it as a pure exponent shift (no floating-point multiply needed):
+    Scale computation and rounding live in hw_float_ops.quantize_bf16_to_e4m3.
+    Corner cases (NaN flush, inf saturate, subnormal DAZ) are handled there.
+    """
+    e4m3_bytes, scale_exp = quantize_bf16_to_e4m3(x)
+    # Reconstruct dequantized float: (E4M3 value) * scale
+    fp8_vals = e4m3_bytes.view(torch.float8_e4m3fn).to(torch.float32)
+    return (fp8_vals * (2.0 ** scale_exp)).to(x.dtype)
 
-    scale = 2^floor(log2(max(|x|) / fp8_max_po2))   (power-of-two)
-    x_q   = clamp(x / scale, ±fp8_max) cast to fp8
-    out   = x_q * scale
+
+# ---------------------------------------------------------------------------
+# E5M2: po2 scaling via PyTorch cast
+# ---------------------------------------------------------------------------
+
+def _quant_fp8_e5m2(x: torch.Tensor) -> torch.Tensor:
+    """
+    Per-tensor po2 scaling for E5M2.  Uses PyTorch's .to(fp8) cast for
+    rounding (not yet ported to a hardware-faithful implementation).
 
     Corner cases matched to RTL:
-    - NaN inputs are flushed to zero before scaling.
-    - Inf inputs are saturated to ±fp8_max by the clamp (scale is derived
-      from finite values only to avoid log2(inf)).
-    - FP8 subnormals in the output are flushed to zero (DAZ).
-    - .to(fp8_dtype) uses round-to-nearest-even, matching hardware.
+    - NaN inputs flushed to zero.
+    - Inf inputs saturated to ±fp8_max by clamp.
+    - FP8 subnormals flushed to zero (DAZ).
     """
-    target = TORCH_DTYPE[fmt]
-    fp8_max = _FP8_MAX[fmt]
-    fp8_max_po2 = _FP8_MAX_PO2[fmt]
-
-    # RTL flushes NaN inputs to zero.
-    x_f32 = x.float().nan_to_num(nan=0.0)
-
-    # Derive scale from finite values only; inf entries will be clamped to
-    # ±fp8_max below, matching hardware's saturate-on-overflow behavior.
-    amax = x_f32.abs().nan_to_num(posinf=0.0).max()
-
-    if amax == 0:
-        if not x_f32.any():
-            # All zeros (or all-NaN input, now flushed).
-            return x_f32.to(x.dtype)
-        # Only ±inf remain; use scale=1 so the clamp saturates them.
-        scale = 1.0
-    else:
-        raw_scale = amax / fp8_max_po2
-        scale = 2.0 ** math.floor(math.log2(raw_scale.item()))
-
-    # clamp saturates inf → ±fp8_max; .to(fp8_dtype) rounds-to-nearest-even.
-    x_scaled = (x_f32 / scale).clamp(-fp8_max, fp8_max)
-    x_q = x_scaled.to(target).to(torch.float32)
-
-    # RTL flushes FP8 subnormals to zero (DAZ).
-    x_q[x_q.abs() < _FP8_MIN_NORMAL[fmt]] = 0.0
-
-    return (x_q * scale).to(x.dtype)
-
-
-# ---------------------------------------------------------------------------
-# Mode 2: Per-tensor absmax scaling
-# ---------------------------------------------------------------------------
-
-def _quant_fp8_scaled(x: torch.Tensor, fmt: QuantFormat) -> torch.Tensor:
-    """
-    Per-tensor absmax scaling.
-
-    scale = max(|x|) / fp8_max       (any float)
-    x_q   = cast(x / scale, fp8)
-    out   = x_q * scale
-
-    Same RTL corner-case handling as _quant_fp8_po2: NaN→0, inf saturated,
-    FP8 subnormals flushed to zero.
-    """
-    target = TORCH_DTYPE[fmt]
-    fp8_max = _FP8_MAX[fmt]
+    fp8_max     = _FP8_MAX[QuantFormat.FLOAT8_E5M2]
+    fp8_max_po2 = _FP8_MAX_PO2[QuantFormat.FLOAT8_E5M2]
+    target      = TORCH_DTYPE[QuantFormat.FLOAT8_E5M2]
 
     x_f32 = x.float().nan_to_num(nan=0.0)
-    amax = x_f32.abs().nan_to_num(posinf=0.0).max()
+    amax  = x_f32.abs().nan_to_num(posinf=0.0).max()
 
     if amax == 0:
         if not x_f32.any():
             return x_f32.to(x.dtype)
         scale = 1.0
     else:
-        scale = amax / fp8_max
+        scale = 2.0 ** math.floor(math.log2((amax / fp8_max_po2).item()))
 
     x_scaled = (x_f32 / scale).clamp(-fp8_max, fp8_max)
     x_q = x_scaled.to(target).to(torch.float32)
-
-    x_q[x_q.abs() < _FP8_MIN_NORMAL[fmt]] = 0.0
-
+    x_q[x_q.abs() < _FP8_MIN_NORMAL[QuantFormat.FLOAT8_E5M2]] = 0.0
     return (x_q * scale).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------
-# Raw FP8 capture (for golden-data storage)
+# Raw FP8 capture (for matmul IO golden-data storage)
 # ---------------------------------------------------------------------------
 
 def quant_fp8_raw(
@@ -238,36 +194,34 @@ def quant_fp8_raw(
     """
     Quantize x to FP8 and return (raw_bytes, scale_exp).
 
-    raw_bytes  : uint8 tensor, same shape as x, containing raw FP8 bit patterns.
-                 View as torch.float8_e4m3fn (or e5m2) to interpret as FP8 values.
-    scale_exp  : int.  The scale is always a power of two: scale = 2 ** scale_exp.
-                 Recover quantized values with:
-                     x_approx = raw_bytes.view(fp8_dtype) * (2 ** scale_exp)
+    raw_bytes  : uint8 tensor, same shape as x, raw FP8 bit patterns.
+                 View as torch.float8_e4m3fn (or e5m2) to interpret.
+    scale_exp  : int.  scale = 2 ** scale_exp.
+                 Recover quantized values:
+                     raw_bytes.view(fp8_dtype) * (2 ** scale_exp)
 
-    Only supported in "po2" mode (set via set_fp8_mode).  Raises if called in
-    "scaled" mode, which produces non-power-of-two scales.
+    For FLOAT8_E4M3: delegates to hw_float_ops.quantize_bf16_to_e4m3 —
+    same hardware-faithful scale and rounding used by the FM path.
+    For FLOAT8_E5M2: uses PyTorch cast (rounding not yet ported).
     """
-    if _fp8_mode != "po2":
-        raise RuntimeError(
-            "quant_fp8_raw requires fp8_mode='po2' (current mode: "
-            f"'{_fp8_mode}').  Non-power-of-two scales cannot be stored as int."
-        )
+    if fmt is QuantFormat.FLOAT8_E4M3:
+        return quantize_bf16_to_e4m3(x)
 
-    target = TORCH_DTYPE[fmt]
-    fp8_max = _FP8_MAX[fmt]
+    # E5M2 fallback
+    fp8_max     = _FP8_MAX[fmt]
     fp8_max_po2 = _FP8_MAX_PO2[fmt]
+    target      = TORCH_DTYPE[fmt]
 
     x_f32 = x.float()
-    amax = x_f32.abs().max().item()
+    amax  = x_f32.abs().max().item()
     if amax == 0:
         raw = torch.zeros_like(x_f32).to(target).view(torch.uint8)
-        return raw, 0  # scale = 2^0 = 1
+        return raw, 0
 
     scale_exp = int(math.floor(math.log2(amax / fp8_max_po2)))
-    scale = 2.0 ** scale_exp
-
-    x_scaled = (x_f32 / scale).clamp(-fp8_max, fp8_max)
-    raw = x_scaled.to(target).view(torch.uint8)
+    scale     = 2.0 ** scale_exp
+    x_scaled  = (x_f32 / scale).clamp(-fp8_max, fp8_max)
+    raw       = x_scaled.to(target).view(torch.uint8)
     return raw, scale_exp
 
 
