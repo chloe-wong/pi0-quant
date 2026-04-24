@@ -215,40 +215,40 @@ def _pow_dispatch(vrf, a: torch.Tensor, exp) -> torch.Tensor:
 # Signature: fn(vrf, *bf16_args) -> tensor
 # ---------------------------------------------------------------------------
 
-def _bcast(a: torch.Tensor, b) -> torch.Tensor:
-    """Coerce b to a tensor matching a's shape (scalar or broadcast)."""
+def _bcast_both(a: torch.Tensor, b) -> tuple:
+    """Expand both a and b to their common broadcast shape."""
     if not isinstance(b, torch.Tensor):
-        return torch.full_like(a, float(b))
+        return a, torch.full_like(a, float(b))
     if a.shape == b.shape:
-        return b
-    # broadcast b to a's shape (e.g. (1,1) → (1,K) for x - rmax(x))
-    b_exp, _ = torch.broadcast_tensors(b, a)
-    return b_exp.contiguous()
+        return a, b
+    a_exp, b_exp = torch.broadcast_tensors(a, b)
+    return a_exp.contiguous(), b_exp.contiguous()
 
 
 _VEC_FM_DISPATCH: dict = {
     # ── Binary elementwise ────────────────────────────────────────────────────
-    # _bcast handles: scalar b, broadcasted b (e.g. rmax result), same-shape b
+    # _bcast_both handles general broadcasting (e.g. outer-product masks);
+    # Scalar variants handle literal scalars separately.
     torch.ops.aten.add.Tensor:
-        lambda vrf, a, b, *rest: vrf.add(a, _bcast(a, b)),
+        lambda vrf, a, b, *rest: vrf.add(*_bcast_both(a, b)),
     torch.ops.aten.add.Scalar:
         # alpha scaling (3rd arg) folded into scalar: a + alpha*b
         lambda vrf, a, b, *rest: vrf.add(
             a, torch.full_like(a, float(b) * (float(rest[0]) if rest else 1.0))
         ),
     torch.ops.aten.sub.Tensor:
-        lambda vrf, a, b, *rest: vrf.sub(a, _bcast(a, b)),
+        lambda vrf, a, b, *rest: vrf.sub(*_bcast_both(a, b)),
     torch.ops.aten.sub.Scalar:
         lambda vrf, a, b, *rest: vrf.sub(
             a, torch.full_like(a, float(b) * (float(rest[0]) if rest else 1.0))
         ),
     torch.ops.aten.mul.Tensor:
-        lambda vrf, a, b: vrf.mul(a, _bcast(a, b)),
+        lambda vrf, a, b: vrf.mul(*_bcast_both(a, b)),
     torch.ops.aten.mul.Scalar:
         lambda vrf, a, b: vrf.mul(a, torch.full_like(a, b)),
     torch.ops.aten.div.Tensor:
         # VPU: rcp then mul (two lane-box passes)
-        lambda vrf, a, b: vrf.mul(a, vrf.rcp(_bcast(a, b))),
+        lambda vrf, a, b: (lambda ae, be: vrf.mul(ae, vrf.rcp(be)))(*_bcast_both(a, b)),
     torch.ops.aten.pow.Tensor_Scalar:
         _pow_dispatch,
     # ── Unary elementwise ─────────────────────────────────────────────────────
