@@ -63,6 +63,7 @@ from collections import defaultdict
 from ._dispatch_guards import _in_quant_guard
 from .model_patcher import QuantGroup, _GROUP_TO_COMPONENTS
 from .stats_tracker import Component, StatsTracker
+from .vector_io_store import VectorIOStore
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +240,7 @@ class VectorQuantMode(TorchDispatchMode):
         verbose: bool = False,
         estimated_total: int = 0,
         active_groups: Optional[set[QuantGroup]] = None,
+        io_store: Optional[VectorIOStore] = None,
     ) -> None:
         super().__init__()
         self.tracker          = tracker
@@ -250,6 +252,7 @@ class VectorQuantMode(TorchDispatchMode):
             frozenset(c for g in active_groups for c in _GROUP_TO_COMPONENTS[g])
             if active_groups is not None else None
         )
+        self.io_store         = io_store
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -286,39 +289,43 @@ class VectorQuantMode(TorchDispatchMode):
             try:
                 out = self._dispatch_fm(func, args, kwargs, vrf)
 
-                if self.tracker is not None:
+                if self.tracker is not None or self.io_store is not None:
                     # Reference output (guard is True so this bypasses dispatch)
                     with torch.no_grad():
                         y_ref = func(*args, **kwargs)
                     y_ref_t = y_ref[0] if isinstance(y_ref, tuple) else y_ref
                     out_t   = out[0]   if isinstance(out,   tuple) else out
                     if isinstance(y_ref_t, torch.Tensor) and isinstance(out_t, torch.Tensor):
-                        self._call_count += 1
                         op_name = getattr(
                             getattr(func, "_overloadpacket", None),
                             "_qualified_op_name",
                             str(func),
                         )
-                        self.tracker.record(
-                            name=f"vec.{layer_tag}.{op_name}.{self._call_count}",
-                            component=current_comp,
-                            y_fp=y_ref_t,
-                            y_quant=out_t,
-                        )
-                        if self.verbose:
-                            last = self.tracker.calls[-1]
-                            rmse = last["rmse"]
-                            total_str = f"/~{self._estimated_total}" if self._estimated_total else ""
-                            pct = (f"{100 * self._call_count // self._estimated_total:3d}%"
-                                   if self._estimated_total else "   ")
-                            op_short = op_name.split("::")[-1]
-                            shape = tuple(args[0].shape) if isinstance(args[0], torch.Tensor) else "?"
-                            print(
-                                f"[VEC | {self._call_count:5d}{total_str} | {pct}]"
-                                f"  {layer_tag:<20}  {op_short:<22}  in={shape}"
-                                f"  rmse={rmse:.6f}",
-                                flush=True,
+                        if self.tracker is not None:
+                            self._call_count += 1
+                            self.tracker.record(
+                                name=f"vec.{layer_tag}.{op_name}.{self._call_count}",
+                                component=current_comp,
+                                y_fp=y_ref_t,
+                                y_quant=out_t,
                             )
+                            if self.verbose:
+                                last = self.tracker.calls[-1]
+                                rmse = last["rmse"]
+                                total_str = f"/~{self._estimated_total}" if self._estimated_total else ""
+                                pct = (f"{100 * self._call_count // self._estimated_total:3d}%"
+                                       if self._estimated_total else "   ")
+                                op_short = op_name.split("::")[-1]
+                                shape = tuple(args[0].shape) if isinstance(args[0], torch.Tensor) else "?"
+                                print(
+                                    f"[VEC | {self._call_count:5d}{total_str} | {pct}]"
+                                    f"  {layer_tag:<20}  {op_short:<22}  in={shape}"
+                                    f"  rmse={rmse:.6f}",
+                                    flush=True,
+                                )
+                        if self.io_store is not None:
+                            tensor_inputs = [a for a in args if isinstance(a, torch.Tensor)]
+                            self.io_store.record(op_name, layer_tag, tensor_inputs, y_ref_t, out_t)
             finally:
                 _in_quant_guard.active = False
             return out
@@ -414,6 +421,7 @@ def patch_vector_ops(
     functional_model=None,
     verbose: bool = False,
     estimated_total: int = 0,
+    io_store: Optional[VectorIOStore] = None,
 ) -> tuple[list, VectorQuantMode, dict]:
     """
     Register layer-tag hooks for attribution and return a
@@ -468,6 +476,7 @@ def patch_vector_ops(
         verbose=verbose,
         estimated_total=estimated_total,
         active_groups=active_groups,
+        io_store=io_store,
     )
 
     fm_label = (
