@@ -263,6 +263,14 @@ class VectorQuantMode(TorchDispatchMode):
         if func not in TARGET_OPS:
             return func(*args, **kwargs)
 
+        # Skip non-floating-point tensors (bool/int index arithmetic, masks, etc.)
+        # The VPU model only handles floating-point; converting bool/int to bfloat16
+        # and back corrupts integer values and can return wrong dtypes (e.g. bool sum
+        # flowing into a subtraction that PyTorch rejects).
+        first_tensor = next((a for a in args if isinstance(a, torch.Tensor)), None)
+        if first_tensor is not None and not first_tensor.is_floating_point():
+            return func(*args, **kwargs)
+
         current_comp, layer_tag = _current_layer()
 
         # Component gate: skip VPU model for inactive components.
