@@ -61,7 +61,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from collections import defaultdict
 
 from ._dispatch_guards import _in_quant_guard
-from .model_patcher import QuantGroup
+from .model_patcher import QuantGroup, _GROUP_TO_COMPONENTS
 from .stats_tracker import Component, StatsTracker
 
 
@@ -238,6 +238,7 @@ class VectorQuantMode(TorchDispatchMode):
         functional_model=None,
         verbose: bool = False,
         estimated_total: int = 0,
+        active_groups: Optional[set[QuantGroup]] = None,
     ) -> None:
         super().__init__()
         self.tracker          = tracker
@@ -245,6 +246,10 @@ class VectorQuantMode(TorchDispatchMode):
         self.verbose          = verbose
         self._estimated_total = estimated_total
         self._call_count      = 0
+        self._active_components: Optional[frozenset[Component]] = (
+            frozenset(c for g in active_groups for c in _GROUP_TO_COMPONENTS[g])
+            if active_groups is not None else None
+        )
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -258,8 +263,13 @@ class VectorQuantMode(TorchDispatchMode):
         if func not in TARGET_OPS:
             return func(*args, **kwargs)
 
-        # Layer tag — labeling only, never gates
         current_comp, layer_tag = _current_layer()
+
+        # Component gate: skip VPU model for inactive components.
+        if (self._active_components is not None
+                and current_comp is not Component.UNKNOWN
+                and current_comp not in self._active_components):
+            return func(*args, **kwargs)
 
         # ── Functional model path ────────────────────────────────────────────
         if self.functional_model is not None:
@@ -449,6 +459,7 @@ def patch_vector_ops(
         functional_model=functional_model,
         verbose=verbose,
         estimated_total=estimated_total,
+        active_groups=active_groups,
     )
 
     fm_label = (
