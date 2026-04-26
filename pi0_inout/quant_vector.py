@@ -241,6 +241,8 @@ class VectorQuantMode(TorchDispatchMode):
         estimated_total: int = 0,
         active_groups: Optional[set[QuantGroup]] = None,
         io_store: Optional[VectorIOStore] = None,
+        capture_mode: bool = False,
+        clean_input_store=None,
     ) -> None:
         super().__init__()
         self.tracker          = tracker
@@ -253,6 +255,8 @@ class VectorQuantMode(TorchDispatchMode):
             if active_groups is not None else None
         )
         self.io_store         = io_store
+        self.capture_mode     = capture_mode
+        self.clean_input_store = clean_input_store
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -282,25 +286,38 @@ class VectorQuantMode(TorchDispatchMode):
                 and current_comp not in self._active_components):
             return func(*args, **kwargs)
 
+        # op_key: used by both capture mode and clean-input lookup
+        op_name = getattr(
+            getattr(func, "_overloadpacket", None),
+            "_qualified_op_name",
+            str(func),
+        )
+        shape_str = "_".join(str(d) for d in first_tensor.shape) if first_tensor is not None else "s"
+        op_key = f"{layer_tag}.{op_name.split('::')[-1]}.{shape_str}"
+
+        # ── Capture mode: store clean args, return reference output unchanged ─
+        if self.capture_mode:
+            if self.clean_input_store is not None:
+                self.clean_input_store.capture(op_key, args)
+            return func(*args, **kwargs)
+
         # ── Functional model path ────────────────────────────────────────────
         if self.functional_model is not None:
             vrf = self.functional_model
+            clean_args = self.clean_input_store.get(op_key) if self.clean_input_store is not None else None
+            effective_args = clean_args if clean_args is not None else args
+
             _in_quant_guard.active = True
             try:
-                out = self._dispatch_fm(func, args, kwargs, vrf)
+                out = self._dispatch_fm(func, effective_args, kwargs, vrf)
 
                 if self.tracker is not None or self.io_store is not None:
                     # Reference output (guard is True so this bypasses dispatch)
                     with torch.no_grad():
-                        y_ref = func(*args, **kwargs)
+                        y_ref = func(*effective_args, **kwargs)
                     y_ref_t = y_ref[0] if isinstance(y_ref, tuple) else y_ref
                     out_t   = out[0]   if isinstance(out,   tuple) else out
                     if isinstance(y_ref_t, torch.Tensor) and isinstance(out_t, torch.Tensor):
-                        op_name = getattr(
-                            getattr(func, "_overloadpacket", None),
-                            "_qualified_op_name",
-                            str(func),
-                        )
                         if self.tracker is not None:
                             self._call_count += 1
                             self.tracker.record(
@@ -316,7 +333,7 @@ class VectorQuantMode(TorchDispatchMode):
                                 pct = (f"{100 * self._call_count // self._estimated_total:3d}%"
                                        if self._estimated_total else "   ")
                                 op_short = op_name.split("::")[-1]
-                                shape = tuple(args[0].shape) if isinstance(args[0], torch.Tensor) else "?"
+                                shape = tuple(effective_args[0].shape) if isinstance(effective_args[0], torch.Tensor) else "?"
                                 print(
                                     f"[VEC | {self._call_count:5d}{total_str} | {pct}]"
                                     f"  {layer_tag:<20}  {op_short:<22}  in={shape}"
@@ -324,8 +341,7 @@ class VectorQuantMode(TorchDispatchMode):
                                     flush=True,
                                 )
                         if self.io_store is not None:
-                            tensor_inputs = [a for a in args if isinstance(a, torch.Tensor)]
-                            self.io_store.record(op_name, layer_tag, tensor_inputs, y_ref_t, out_t)
+                            self.io_store.record(op_name, layer_tag, list(effective_args), y_ref_t, out_t)
             finally:
                 _in_quant_guard.active = False
             return out
@@ -422,6 +438,8 @@ def patch_vector_ops(
     verbose: bool = False,
     estimated_total: int = 0,
     io_store: Optional[VectorIOStore] = None,
+    capture_mode: bool = False,
+    clean_input_store=None,
 ) -> tuple[list, VectorQuantMode, dict]:
     """
     Register layer-tag hooks for attribution and return a
@@ -477,6 +495,8 @@ def patch_vector_ops(
         estimated_total=estimated_total,
         active_groups=active_groups,
         io_store=io_store,
+        capture_mode=capture_mode,
+        clean_input_store=clean_input_store,
     )
 
     fm_label = (

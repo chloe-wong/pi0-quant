@@ -40,6 +40,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import datetime
 import json
@@ -456,6 +457,17 @@ def run(
     }
     ref_hooks = ref_store.register_hooks(model, layer_names)
 
+    # Capture clean vector-op args during the reference pass for error-free RMSE replay.
+    clean_input_store = ReferenceStore() if vec_fm is not None else None
+    if clean_input_store is not None:
+        cap_handles, cap_ctx, _ = patch_vector_ops(
+            model,
+            active_groups=active_groups,
+            functional_model=None,
+            capture_mode=True,
+            clean_input_store=clean_input_store,
+        )
+
     if OpScope.ATTENTION in op_scopes:
         import torch.nn.functional as _F_ref
         from transformers.models.gemma import modeling_gemma as _mg_ref
@@ -476,13 +488,17 @@ def run(
         _mg_ref.eager_attention_forward    = _ref_capture_eager
         _F_ref.scaled_dot_product_attention = _ref_capture_sdpa
 
-    with torch.no_grad():
+    _cap_ctx = cap_ctx if clean_input_store is not None else contextlib.nullcontext()
+    with torch.no_grad(), _cap_ctx:
         for i, obs in enumerate(observations):
             torch.manual_seed(i)
             ref_store.reset_counters()
             model.sample_actions(str(device), obs, num_steps=num_steps)
     for h in ref_hooks:
         h.remove()
+    if clean_input_store is not None:
+        unpatch_vector_ops(cap_handles)
+        clean_input_store.reset_counters()
 
     if OpScope.ATTENTION in op_scopes:
         _mg_ref.eager_attention_forward    = _ref_orig_eager
@@ -552,6 +568,7 @@ def run(
         verbose=trace,
         estimated_total=_estimated_total,
         io_store=vector_io_store,
+        clean_input_store=clean_input_store,
     )
 
     n_obs = len(observations)
