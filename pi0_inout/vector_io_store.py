@@ -13,9 +13,11 @@ For each intercepted vector op, calls are stored consecutively:
   ...
   call{N}_reference_output bf16 raw bits — passthrough (aten op) output
   call{N}_fm_output        bf16 raw bits — VPU functional model output
+  call{N}_rmse             float32 scalar — RMSE(reference_output, fm_output)
 
 All bf16 tensors stored as int16 raw bits.
   Reconstruct: torch.from_numpy(arr).view(torch.bfloat16)
+rmse stored as plain float32 scalar (not encoded).
 
 File naming
 -----------
@@ -64,6 +66,7 @@ class VectorIOStore:
         inputs: List[Any],
         ref_output: torch.Tensor,
         fm_output: torch.Tensor,
+        rmse: float = 0.0,
     ) -> None:
         """Record one op invocation.
 
@@ -72,6 +75,7 @@ class VectorIOStore:
         inputs    : all positional args (tensors and scalars)
         ref_output: passthrough (aten) output tensor
         fm_output : VPU functional model output tensor
+        rmse      : RMSE(ref_output, fm_output) — stored as float32 scalar
         """
         op_short = op_name.split("::")[-1]
         key = f"{layer_tag}.{op_short}"
@@ -86,6 +90,7 @@ class VectorIOStore:
 
         entry["reference_output"] = _to_bf16_numpy(ref_output)
         entry["fm_output"]        = _to_bf16_numpy(fm_output)
+        entry["rmse"]             = np.float32(rmse)
 
         self._calls[key].append(entry)
 
@@ -105,7 +110,9 @@ class VectorIOStore:
                         return (0, k)
                     if k == "reference_output":
                         return (1, k)
-                    return (2, k)  # fm_output
+                    if k == "fm_output":
+                        return (2, k)
+                    return (3, k)  # rmse
                 for arg_key in sorted(call.keys(), key=_key_order):
                     arrays[f"call{i}_{arg_key}"] = call[arg_key]
 

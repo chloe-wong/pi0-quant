@@ -322,6 +322,7 @@ Reconstruct with: `torch.from_numpy(arr).view(torch.bfloat16)`
 | `call{N}_input_1` | Second positional argument for call N (if present) |
 | `call{N}_reference_output` | Passthrough (aten) output for call N |
 | `call{N}_fm_output` | VPU functional model output for call N |
+| `call{N}_rmse` | `float32` scalar — RMSE between `reference_output` and `fm_output` for call N |
 
 ---
 

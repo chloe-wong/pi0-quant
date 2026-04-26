@@ -18,6 +18,7 @@ Per-call keys (call index N):
   ...
   call{N}_reference_output passthrough (aten op) output
   call{N}_fm_output        VPU functional model output
+  call{N}_rmse             float32 scalar — RMSE(reference_output, fm_output)
 
 File naming: {layer_tag}__{op_short}.npz  (dots in layer_tag → __)
 """
@@ -25,6 +26,7 @@ File naming: {layer_tag}__{op_short}.npz  (dots in layer_tag → __)
 import argparse
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -42,7 +44,9 @@ def _field_sort_key(field: str) -> tuple:
         return (0, field)
     if field == "reference_output":
         return (1, field)
-    return (2, field)  # fm_output
+    if field == "fm_output":
+        return (2, field)
+    return (3, field)  # rmse
 
 
 def load_call(path: str, call_idx: int = 0):
@@ -56,31 +60,31 @@ def load_call(path: str, call_idx: int = 0):
     fields = [k[len(prefix):] for k in data.files if k.startswith(prefix)]
     fields.sort(key=_field_sort_key)
 
-    tensors: OrderedDict[str, torch.Tensor] = OrderedDict()
+    tensors: OrderedDict[str, Any] = OrderedDict()
     for field in fields:
-        tensors[field] = decode_bf16(data[f"{prefix}{field}"])
+        if field == "rmse":
+            tensors[field] = float(data[f"{prefix}{field}"])
+        else:
+            tensors[field] = decode_bf16(data[f"{prefix}{field}"])
 
     return tensors, n_calls
 
 
 def summarize(tensors: dict, *, emit=print):
     lines = []
+    if "rmse" in tensors:
+        lines.append(f"RMSE : {tensors['rmse']:.8f}\n")
     lines.append(f"{'Field':<20}  {'Shape':<25}  {'min':>12}  {'max':>12}  {'mean':>12}")
     lines.append("-" * 85)
     for name, t in tensors.items():
+        if name == "rmse":
+            continue
         t_f = t.float()
         lines.append(
             f"{name:<20}  {str(tuple(t_f.shape)):<25}  "
             f"{t_f.min().item():>12.6f}  {t_f.max().item():>12.6f}  "
             f"{t_f.mean().item():>12.6f}"
         )
-
-    if "reference_output" in tensors and "fm_output" in tensors:
-        ref = tensors["reference_output"].float()
-        fm  = tensors["fm_output"].float()
-        rmse = (ref - fm).pow(2).mean().sqrt().item()
-        lines.append("-" * 85)
-        lines.append(f"{'RMSE(ref, fm)':<20}  {rmse:.8f}")
 
     emit("\n".join(lines))
 
@@ -117,14 +121,11 @@ def main():
         summarize(tensors, emit=emit)
     else:
         for name, t in tensors.items():
-            emit(f"\n=== {name}  shape={tuple(t.shape)} ===")
-            emit(str(t))
-
-        if "reference_output" in tensors and "fm_output" in tensors:
-            ref  = tensors["reference_output"].float()
-            fm   = tensors["fm_output"].float()
-            rmse = (ref - fm).pow(2).mean().sqrt().item()
-            emit(f"\nRMSE(reference_output, fm_output) = {rmse:.8f}")
+            if name == "rmse":
+                emit(f"\n=== rmse ===\n{t:.8f}")
+            else:
+                emit(f"\n=== {name}  shape={tuple(t.shape)} ===")
+                emit(str(t))
 
     if log_file is not None:
         log_file.close()

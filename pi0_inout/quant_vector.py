@@ -341,7 +341,8 @@ class VectorQuantMode(TorchDispatchMode):
                                     flush=True,
                                 )
                         if self.io_store is not None:
-                            self.io_store.record(op_name, layer_tag, list(effective_args), y_ref_t, out_t)
+                            _rmse = self.tracker.calls[-1]["rmse"] if self.tracker is not None else 0.0
+                            self.io_store.record(op_name, layer_tag, list(effective_args), y_ref_t, out_t, rmse=_rmse)
             finally:
                 _in_quant_guard.active = False
             return out
