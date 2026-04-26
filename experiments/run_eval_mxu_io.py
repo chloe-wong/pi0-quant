@@ -633,11 +633,10 @@ def run(
         )
     else:
         attn_handles = []
-    vec_handles, vec_ctx = patch_vector_ops(
+        
+    vec_handles, vec_ctx, _vec_hook_fires = patch_vector_ops(
         model,
         active_groups=active_groups,
-        vec_input_fmt=_vi,
-        vec_output_fmt=_vo,
         tracker=vec_tracker,
     )
 

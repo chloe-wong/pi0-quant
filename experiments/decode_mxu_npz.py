@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-decode_npz.py — Decode a MatmulIOStore .npz file and recover original float values.
+decode_mxu_npz.py — Decode a MatmulIOStore .npz file and recover original float values.
 
 Usage:
-    python decode_npz.py path/to/layer.npz [--summary] [--call 0] [--log-dir DIR]
+    python decode_mxu_npz.py path/to/layer.npz [--summary] [--call 0] [--log-dir DIR]
 
 Requirements: torch >= 2.1, numpy
 
