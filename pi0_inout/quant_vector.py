@@ -295,11 +295,15 @@ class VectorQuantMode(TorchDispatchMode):
         shape_str = "_".join(str(d) for d in first_tensor.shape) if first_tensor is not None else "s"
         op_key = f"{layer_tag}.{op_name.split('::')[-1]}.{shape_str}"
 
-        # ── Capture mode: store clean args, return reference output unchanged ─
+        # ── Capture mode: store clean args + Pass 1 output, return unchanged ──
         if self.capture_mode:
+            y = func(*args, **kwargs)
             if self.clean_input_store is not None:
                 self.clean_input_store.capture(op_key, args)
-            return func(*args, **kwargs)
+                y_t = y[0] if isinstance(y, tuple) else y
+                if isinstance(y_t, torch.Tensor):
+                    self.clean_input_store.capture(f"{op_key}.__out__", (y_t,))
+            return y
 
         # ── Functional model path ────────────────────────────────────────────
         if self.functional_model is not None:
@@ -312,10 +316,12 @@ class VectorQuantMode(TorchDispatchMode):
                 out = self._dispatch_fm(func, effective_args, kwargs, vrf)
 
                 if self.tracker is not None or self.io_store is not None:
-                    # Reference output (guard is True so this bypasses dispatch)
-                    with torch.no_grad():
-                        y_ref = func(*effective_args, **kwargs)
-                    y_ref_t = y_ref[0] if isinstance(y_ref, tuple) else y_ref
+                    y_ref_t = None
+                    if self.clean_input_store is not None:
+                        _stored = self.clean_input_store.get(f"{op_key}.__out__")
+                        if _stored is not None:
+                            y_ref_t = _stored[0]
+                    # No fall back
                     out_t   = out[0]   if isinstance(out,   tuple) else out
                     if isinstance(y_ref_t, torch.Tensor) and isinstance(out_t, torch.Tensor):
                         if self.tracker is not None:
