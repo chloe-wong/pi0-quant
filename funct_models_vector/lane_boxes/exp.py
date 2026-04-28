@@ -141,7 +141,7 @@ def _build_local_exp2_bf16_bits(module) -> Callable[[int, int], int]:
 
 def _load_exact_exp_bf16_bits():
     model_path = (
-        Path(__file__).resolve().parents[5]
+        Path(__file__).resolve().parents[2]
         / "dependencies"
         / "fpex"
         / "model"
