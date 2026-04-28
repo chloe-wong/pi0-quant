@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-verify_npz.py — Decode a MatmulIOStore .npz file and recover original float values.
+decode_mxu_npz.py — Decode a MatmulIOStore .npz file and recover original float values.
 
 Usage:
-    python verify_npz.py path/to/layer.npz [--summary] [--call 0] [--log-dir DIR]
+    python decode_mxu_npz.py path/to/layer.npz [--summary] [--call 0] [--log-dir DIR]
 
 Requirements: torch >= 2.1, numpy
 
@@ -35,21 +35,21 @@ torch.set_printoptions(threshold=torch.inf)
 # ── Reconstruction helpers ──────────────────────────────────────────────────
 
 def decode_bf16(arr: np.ndarray) -> torch.Tensor:
-    """int16 raw-bit array → bfloat16 tensor → float32 for display."""
-    return torch.from_numpy(arr).view(torch.bfloat16).float()
+    """int16 raw-bit array → native bfloat16 tensor."""
+    return torch.from_numpy(arr).view(torch.bfloat16)
 
 
-def decode_fp8_e4m3(raw_uint8: np.ndarray, scale_exp: int) -> torch.Tensor:
+def decode_fp8_e4m3(raw_uint8: np.ndarray, scale_exp: int) -> tuple[torch.Tensor, int]:
     """
-    Equation:  x_quant = view_as_fp8_e4m3(raw_uint8) * (2 ** scale_exp)
+    uint8 raw-bit array → (native float8_e4m3fn tensor, scale_exp).
 
     raw_uint8  : uint8 ndarray — raw FP8-E4M3 bit patterns (1 byte per element)
     scale_exp  : int (PER-TENSOR — one exponent shared across ALL elements)
                  e.g. scale_exp=5 means scale=32.0
-    Returns    : float32 tensor with reconstructed quantized values
+    Returns    : (fp8_tensor, scale_exp)
+                 Dequantized value = fp8_tensor.float() * (2 ** scale_exp)
     """
-    fp8_tensor = torch.from_numpy(raw_uint8).view(torch.float8_e4m3fn)
-    return fp8_tensor.float() * (2.0 ** scale_exp)
+    return torch.from_numpy(raw_uint8).view(torch.float8_e4m3fn), scale_exp
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -88,9 +88,9 @@ def load_layer(path: str, call_idx: int = 0):
         raw   = get(raw_key)
         scale = get(scale_key)
         if raw is not None and scale is not None:
-            exp = int(scale)
+            fp8_tensor, exp = decode_fp8_e4m3(raw, int(scale))
             scale_exps[f"patched_{field}"] = exp
-            results[f"patched_{field}"] = decode_fp8_e4m3(raw, exp)
+            results[f"patched_{field}"] = fp8_tensor
 
     # ── Patched output ──
     raw = get("patched_y_quant")
@@ -100,14 +100,21 @@ def load_layer(path: str, call_idx: int = 0):
     return results, scale_exps, data
 
 
-def summarize(tensors: dict):
-    print(f"{'Field':<20}  {'Shape':<25}  {'min':>12}  {'max':>12}  {'mean':>12}")
-    print("-" * 85)
+def summarize(tensors: dict, scale_exps: dict, *, emit=print):
+    lines = []
+    lines.append(f"{'Field':<20}  {'Shape':<25}  {'min':>12}  {'max':>12}  {'mean':>12}  {'scale_exp':>10}")
+    lines.append("-" * 97)
     for name, t in tensors.items():
-        t_f = t.float()
-        print(f"{name:<20}  {str(tuple(t_f.shape)):<25}  "
-              f"{t_f.min().item():>12.6f}  {t_f.max().item():>12.6f}  "
-              f"{t_f.mean().item():>12.6f}")
+        # fp8 doesn't support min/max/mean — cast to float32 with scale applied
+        if name in scale_exps:
+            t_f = t.float() * (2.0 ** scale_exps[name])
+        else:
+            t_f = t
+        exp_str = str(scale_exps[name]) if name in scale_exps else ""
+        lines.append(f"{name:<20}  {str(tuple(t_f.shape)):<25}  "
+                     f"{t_f.min().item():>12.6f}  {t_f.max().item():>12.6f}  "
+                     f"{t_f.mean().item():>12.6f}  {exp_str:>10}")
+    emit("\n".join(lines))
 
 
 def main():
@@ -140,18 +147,7 @@ def main():
     tensors, scale_exps, _ = load_layer(args.npz, call_idx=args.call)
 
     if args.summary:
-        lines = []
-        lines.append(f"{'Field':<20}  {'Shape':<25}  {'min':>12}  {'max':>12}  {'mean':>12}  {'scale_exp':>10}")
-        lines.append("-" * 97)
-        for name, t in tensors.items():
-            t_f = t.float()
-            exp_str = str(scale_exps[name]) if name in scale_exps else ""
-            lines.append(
-                f"{name:<20}  {str(tuple(t_f.shape)):<25}  "
-                f"{t_f.min().item():>12.6f}  {t_f.max().item():>12.6f}  "
-                f"{t_f.mean().item():>12.6f}  {exp_str:>10}"
-            )
-        emit("\n".join(lines))
+        summarize(tensors, scale_exps, emit=emit)
     else:
         for name, t in tensors.items():
             exp_str = f"  scale_exp={scale_exps[name]}  (scale={2**scale_exps[name]})" if name in scale_exps else ""

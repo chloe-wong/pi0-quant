@@ -44,6 +44,7 @@ from .quant_vector import (
     patch_vector_ops, unpatch_vector_ops,
     VectorQuantMode, TARGET_OPS,
 )
+from .vector_io_store import VectorIOStore
 from .functional_models import (
     register_functional_model,
     get_functional_model_factory,
@@ -95,6 +96,7 @@ __all__ = [
     "unpatch_vector_ops",
     "VectorQuantMode",
     "TARGET_OPS",
+    "VectorIOStore",
     # Functional model registry
     "register_functional_model",
     "get_functional_model_factory",

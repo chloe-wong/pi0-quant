@@ -24,22 +24,23 @@ Usage in run_eval.py:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 
 class ReferenceStore:
     """
-    Stores reference (unpatched) layer outputs captured via forward hooks.
+    Stores reference (unpatched) layer outputs captured via forward hooks,
+    or full op-args tuples for vector-op clean-input replay.
 
-    For each named layer, outputs are stored in call order as a list.
+    For each named key, values are stored in call order as a list.
     During the patched forward pass, get() returns them in the same order.
     Call reset_counters() between observations to restart the lookup index.
     """
 
     def __init__(self) -> None:
-        # layer_name -> [tensor_call0, tensor_call1, ...]  (CPU, detached)
-        self._outputs: dict[str, list[torch.Tensor]] = {}
-        # per-layer call index for the current patched forward pass
+        self._outputs: dict[str, list] = {}
         self._counters: dict[str, int] = {}
 
     def register_hooks(self, model: torch.nn.Module, layer_names: set[str]) -> list:
@@ -63,7 +64,7 @@ class ReferenceStore:
             handles.append(module.register_forward_hook(_make_hook(name)))
         return handles
 
-    def get(self, name: str) -> torch.Tensor | None:
+    def get(self, name: str) -> Any:
         """
         Return the next reference output for this layer (call-order aware).
         Returns None if no reference was captured for this layer.
@@ -77,15 +78,27 @@ class ReferenceStore:
         self._counters[name] = idx + 1
         return outputs[idx]
 
-    def capture(self, name: str, tensor: torch.Tensor) -> None:
+    def capture(self, name: str, value: Any) -> None:
         """
-        Manually store a tensor under `name` (same contract as hook-based capture).
+        Manually store a value under `name` (same contract as hook-based capture).
         Use for function-level ops (e.g. eager_attention_forward, SDPA) that are not
         nn.Module outputs and can't be captured via register_hooks.
+
+          Tensor        → stored as .detach().cpu()
+          Tuple of args → each tensor .detach().clone() (device preserved),
+                          scalars kept as Python scalars
+          Other         → stored as-is
         """
-        if name not in self._outputs:
-            self._outputs[name] = []
-        self._outputs[name].append(tensor.detach().cpu())
+        if isinstance(value, torch.Tensor):
+            stored: Any = value.detach().cpu()
+        elif isinstance(value, tuple):
+            stored = tuple(
+                a.detach().clone() if isinstance(a, torch.Tensor) else a
+                for a in value
+            )
+        else:
+            stored = value
+        self._outputs.setdefault(name, []).append(stored)
 
     def reset_counters(self) -> None:
         """Reset per-layer call indices. Call before each patched forward pass."""
