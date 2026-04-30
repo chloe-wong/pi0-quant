@@ -99,14 +99,21 @@ def main():
     parser.add_argument("--log-dir", type=str, default=None,
                         help="Directory to save log file (default: print to stdout only). "
                              "Log file is named after the .npz stem, e.g. vision__add_call0.log")
+    parser.add_argument("--all-calls", action="store_true",
+                        help="Decode all calls in the file (ignores --call)")
     args = parser.parse_args()
 
+    data = np.load(args.npz)
+    n_calls = int(data["n_calls"])
+    call_indices = range(n_calls) if args.all_calls else [args.call]
+
+    stem = Path(args.npz).stem
     log_file = None
     if args.log_dir is not None:
         log_dir = Path(args.log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
-        stem = Path(args.npz).stem
-        log_path = log_dir / f"{stem}_call{args.call}.log"
+        suffix = "all" if args.all_calls else f"call{args.call}"
+        log_path = log_dir / f"{stem}_{suffix}.log"
         log_file = open(log_path, "w")
         print(f"Logging to {log_path}")
 
@@ -115,17 +122,19 @@ def main():
         if log_file is not None:
             print(*a, **kw, file=log_file)
 
-    tensors, _ = load_call(args.npz, call_idx=args.call)
+    for call_idx in call_indices:
+        emit(f"\n{'='*60}\n CALL {call_idx}\n{'='*60}")
+        tensors, _ = load_call(args.npz, call_idx=call_idx)
 
-    if args.summary:
-        summarize(tensors, emit=emit)
-    else:
-        for name, t in tensors.items():
-            if name == "rmse":
-                emit(f"\n=== rmse ===\n{t:.8f}")
-            else:
-                emit(f"\n=== {name}  shape={tuple(t.shape)} ===")
-                emit(str(t))
+        if args.summary:
+            summarize(tensors, emit=emit)
+        else:
+            for name, t in tensors.items():
+                if name == "rmse":
+                    emit(f"\n=== rmse ===\n{t:.8f}")
+                else:
+                    emit(f"\n=== {name}  shape={tuple(t.shape)} ===")
+                    emit(str(t))
 
     if log_file is not None:
         log_file.close()
