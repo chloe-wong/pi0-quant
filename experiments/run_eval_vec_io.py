@@ -72,6 +72,7 @@ from pi0_inout import (
     patch_attn_siglip_eager, unpatch_attn_siglip_eager,
     patch_vector_ops, unpatch_vector_ops,
     VectorIOStore,
+    get_functional_model_factory, list_functional_models,
 )
 from pi0_inout.model_patcher import OpScope, ALL_SCOPES, patch_conv2d, unpatch_conv2d
 from pi0_inout.reference_store import ReferenceStore
@@ -441,6 +442,7 @@ def run(
     vector_io_store: Optional[VectorIOStore] = None,
     propagate_noise: bool = False,
     out_dir: Optional[Path] = None,
+    functional_model_name: Optional[str] = None,
 ) -> tuple[StatsTracker, StatsTracker]:
     """Patch model, run observations, unpatch. Returns (mx_tracker, vec_tracker)."""
     mx_tracker  = StatsTracker()
@@ -450,6 +452,10 @@ def run(
     if vec_functional_model_name is not None:
         from funct_models_vector.vector_rtl_forward import VectorRTLFunctions
         vec_fm = VectorRTLFunctions(num_lanes=16)
+
+    fm_factory = None
+    if functional_model_name is not None:
+        fm_factory = get_functional_model_factory(functional_model_name)
 
     # ── Capture reference layer outputs for cumulative RMSE ──────────────────
     ref_store = ReferenceStore()
@@ -510,14 +516,14 @@ def run(
 
     print(f"[reference_store] Captured {len(ref_store)} reference layer outputs.")
 
-    # ── Patch model (linear/conv2d/attention with BF16 passthrough) ───────────
+    # ── Patch model (linear/conv2d/attention; FM applies if --functional-model is set) ──
     patch_model(
         model,
         mx_input_fmt=QuantFormat.BFLOAT16,
         mx_output_fmt=QuantFormat.BFLOAT16,
         tracker=mx_tracker,
         active_groups=active_groups,
-        functional_model_factory=None,
+        functional_model_factory=fm_factory,
         op_scopes=op_scopes,
         reference_store=ref_store,
         trace=trace,
@@ -536,7 +542,7 @@ def run(
             mx_output_fmt=QuantFormat.BFLOAT16,
             tracker=mx_tracker,
             active_groups=active_groups,
-            functional_model_factory=None,
+            functional_model_factory=fm_factory,
             reference_store=ref_store,
         )
     if OpScope.ATTENTION in op_scopes:
@@ -544,21 +550,21 @@ def run(
             model,
             active_groups=active_groups,
             tracker=mx_tracker,
-            functional_model_factory=None,
+            functional_model_factory=fm_factory,
             reference_store=ref_store,
         )
         patch_attn_eager(
             model,
             active_groups=active_groups,
             tracker=mx_tracker,
-            functional_model_factory=None,
+            functional_model_factory=fm_factory,
             reference_store=ref_store,
         )
         patch_attn_siglip_eager(
             model,
             active_groups=active_groups,
             tracker=mx_tracker,
-            functional_model_factory=None,
+            functional_model_factory=fm_factory,
             reference_store=ref_store,
         )
     else:
@@ -650,6 +656,12 @@ def main() -> None:
                         default=None,
                         help="Route all vector ops through VectorRTLFunctions. "
                              "Required when --save-tensors is set.")
+
+    # Matrix path
+    parser.add_argument("--functional-model", metavar="NAME",
+                        default=None,
+                        help=f"Hardware-accurate model for matmuls (linear/conv2d/attention). "
+                             f"Available: {list_functional_models()}. Default: BF16 passthrough.")
 
     # Op scope selection
     all_scope_names = [s.value for s in ALL_SCOPES]
@@ -762,6 +774,7 @@ def main() -> None:
         vector_io_store=vector_io_store,
         propagate_noise=args.propagate_noise,
         out_dir=out_dir,
+        functional_model_name=args.functional_model,
     )
     elapsed_s = time.monotonic() - t0
     config_record["elapsed_seconds"] = round(elapsed_s, 2)
