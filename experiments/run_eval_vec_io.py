@@ -439,6 +439,8 @@ def run(
     t0: float,
     trace: bool = False,
     vector_io_store: Optional[VectorIOStore] = None,
+    no_clean_input: bool = False,
+    out_dir: Optional[Path] = None,
 ) -> tuple[StatsTracker, StatsTracker]:
     """Patch model, run observations, unpatch. Returns (mx_tracker, vec_tracker)."""
     mx_tracker  = StatsTracker()
@@ -458,7 +460,9 @@ def run(
     ref_hooks = ref_store.register_hooks(model, layer_names)
 
     # Capture clean vector-op args during the reference pass for error-free RMSE replay.
-    clean_input_store = ReferenceStore() if vec_fm is not None else None
+    # When no_clean_input is set, skip Pass 1 entirely so FM outputs propagate forward
+    # in Pass 2 and quantization noise accumulates end-to-end.
+    clean_input_store = ReferenceStore() if (vec_fm is not None and not no_clean_input) else None
     if clean_input_store is not None:
         cap_handles, cap_ctx, _ = patch_vector_ops(
             model,
@@ -582,7 +586,10 @@ def run(
             obs_t0 = time.monotonic()
             torch.manual_seed(i)
             ref_store.reset_counters()
-            model.sample_actions(str(device), obs, num_steps=num_steps)
+            actions = model.sample_actions(str(device), obs, num_steps=num_steps)
+            if out_dir is not None:
+                np.save(str(out_dir / f"actions_{i:04d}.npy"),
+                        actions.detach().float().cpu().numpy())
             obs_elapsed = time.monotonic() - obs_t0
             print(f"[obs {i + 1}/{n_obs}] done in {obs_elapsed:.1f}s", flush=True)
             _print_intermediate(
@@ -664,6 +671,11 @@ def main() -> None:
                         help="Save per-op vector I/O tensors to "
                              "<results-dir>/<label>/vec_tensors/ (one .npz per (layer, op)). "
                              "Requires --vec-functional-model.")
+    parser.add_argument("--no-clean-input", action="store_true",
+                        help="Disable two-pass clean-input mode. FM outputs propagate forward "
+                             "as inputs to subsequent ops, letting quantization noise accumulate "
+                             "end-to-end. Always saves the final action chunk per obs to "
+                             "actions_<i>.npy. Incompatible with --save-tensors.")
     parser.add_argument("--trace", action="store_true",
                         help="Print one line per op as it fires with shape and RMSE.")
 
@@ -671,6 +683,9 @@ def main() -> None:
 
     if args.save_tensors and args.vec_functional_model is None:
         parser.error("--save-tensors requires --vec-functional-model (no FM means no fm_output to store)")
+    if args.no_clean_input and args.save_tensors:
+        parser.error("--no-clean-input is incompatible with --save-tensors "
+                     "(per-op reference outputs are not meaningful when noise propagates)")
 
     op_scopes: set[OpScope] = set()
     for s in args.ops.split(","):
@@ -743,6 +758,8 @@ def main() -> None:
         t0=t0,
         trace=args.trace,
         vector_io_store=vector_io_store,
+        no_clean_input=args.no_clean_input,
+        out_dir=out_dir,
     )
     elapsed_s = time.monotonic() - t0
     config_record["elapsed_seconds"] = round(elapsed_s, 2)
