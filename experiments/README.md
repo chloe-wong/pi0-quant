@@ -355,5 +355,62 @@ uv run python experiments/decode_vec_npz.py path/to/layer.npz --summary --call 1
 |---|---|---|
 | `npz` | *(required)* | Path to `.npz` file from `--save-tensors` |
 | `--summary` | off | Print per-tensor stats (min/max/mean) and RMSE(reference\_output, fm\_output) instead of raw values |
-| `--call` | `0` | Which inference call index to decode |
+| `--call` | `0` | Which inference call index to decode (ignored when `--all-calls` is set) |
+| `--all-calls` | off | Decode all calls in the file and print each; ignores `--call` |
 | `--log-dir` | stdout only | Directory to write a `.log` file; filename is `<stem>_call<N>.log` |
+
+---
+
+## Analyse vector-op log files (`analyze_vec_log.py`)
+
+`analyze_vec_log.py` parses `*_all.log` files produced by `decode_vec_npz.py --all-calls`
+and reports numerical anomalies per CALL block: NaN/Inf in `fm_output`, sign flips vs
+`reference_output`, high relative error, and absolute outliers. For each finding it prints
+the worst offending elements with their input values, ref, fm, diff, and relative error.
+It also verifies that the stored RMSE matches the recomputed value.
+
+### Usage
+
+```bash
+# Analyse a single log file, show all calls:
+uv run python experiments/analyze_vec_log.py \
+    experiments/results/input_capture_vpu_io_action/logs/expert__17___softmax_all.log
+
+# Analyse all *_all.log files in a directory, write per-file analysis logs and a CSV summary:
+uv run python experiments/analyze_vec_log.py \
+    experiments/results/input_capture_vpu_io_action/logs/ \
+    --log-dir experiments/results/input_capture_vpu_io_action/logs/ \
+    --csv experiments/results/input_capture_vpu_io_action/analysis_summary.csv \
+    --only-analysis
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `path` | *(required)* | A single `*_all.log` file or a directory of `*_all.log` files |
+| `--rel-err-threshold` | `0.5` | `\|diff\|/\|ref\|` threshold for `high_rel_err` flag |
+| `--outlier-k` | `10` | `k` for `\|diff\| > k × rms(diff)` absolute-outlier test |
+| `--sign-flip-min` | `1e-4` | Minimum `\|ref\|` required to count a sign flip |
+| `--top-n` | `5` | Number of worst elements printed per check |
+| `--only-analysis` | off | Skip CALL blocks with no findings |
+| `--csv` | — | Append one CSV row per `(file, call)` to this file |
+| `--log-dir` | stdout only | Save full text output to `DIR/<stem>_analysis.log` per input file (also prints to stdout) |
+| `--max-calls` | all | Stop after N calls per file |
+
+### Output
+
+Per CALL block the script reports four checks:
+
+| Check | Meaning |
+|---|---|
+| `nan_inf` | Elements where `fm_output` is NaN or Inf |
+| `sign_flip` | Elements where `sign(fm) ≠ sign(ref)` and `\|ref\| > --sign-flip-min` |
+| `high_rel_err` | Elements where `\|fm − ref\| / \|ref\| > --rel-err-threshold` |
+| `abs_outlier` | Elements where `\|fm − ref\| > k × rms(fm − ref)` |
+
+Each check shows a count and fraction, followed by the `--top-n` worst elements (index, input values, ref, fm, diff, rel).
+A final `rmse` line shows the stored scalar from the `.npz` and the recomputed value; a `✗ MISMATCH` flag appears if they differ by more than 1%.
+
+When `--csv` is set, one row is appended per `(file, call)` with columns:
+`file`, `call`, `n_elem`, `nan_inf`, `sign_flip`, `sign_flip_frac`, `high_rel_err`, `high_rel_err_frac`, `abs_outlier`, `abs_outlier_frac`, `stored_rmse`, `recomputed_rmse`, `rmse_mismatch`.
