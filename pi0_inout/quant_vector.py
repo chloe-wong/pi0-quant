@@ -62,6 +62,7 @@ from collections import defaultdict
 
 from ._dispatch_guards import _in_quant_guard
 from .model_patcher import QuantGroup, _GROUP_TO_COMPONENTS
+from .quant_types import QuantFormat, quant
 from .stats_tracker import Component, StatsTracker
 from .vector_io_store import VectorIOStore
 
@@ -196,6 +197,24 @@ def _current_layer() -> tuple[Component, str]:
     return (Component.UNKNOWN, "unattributed")
 
 
+def _bf16_quant_value(value):
+    """Quantize floating tensors to BF16 while preserving non-tensor metadata."""
+    if isinstance(value, torch.Tensor):
+        return quant(value, QuantFormat.BFLOAT16) if value.is_floating_point() else value
+    if isinstance(value, tuple):
+        return tuple(_bf16_quant_value(v) for v in value)
+    if isinstance(value, list):
+        return [_bf16_quant_value(v) for v in value]
+    return value
+
+
+def _bf16_quant_call(args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+    """Return call args/kwargs with floating tensor values quantized to BF16."""
+    bf16_args = tuple(_bf16_quant_value(a) for a in args)
+    bf16_kwargs = {k: _bf16_quant_value(v) for k, v in kwargs.items()}
+    return bf16_args, bf16_kwargs
+
+
 # ---------------------------------------------------------------------------
 # Helpers for dimension-aware reductions (amax, sum, mean)
 # ---------------------------------------------------------------------------
@@ -295,11 +314,12 @@ class VectorQuantMode(TorchDispatchMode):
         shape_str = "_".join(str(d) for d in first_tensor.shape) if first_tensor is not None else "s"
         op_key = f"{layer_tag}.{op_name.split('::')[-1]}.{shape_str}"
 
-        # ── Capture mode: store clean args + Pass 1 output, return unchanged ──
+        # ── Capture mode: store BF16 args
         if self.capture_mode:
-            y = func(*args, **kwargs)
+            bf16_args, bf16_kwargs = _bf16_quant_call(args, kwargs)
+            y = func(*bf16_args, **bf16_kwargs)
             if self.clean_input_store is not None:
-                self.clean_input_store.capture(op_key, args)
+                self.clean_input_store.capture(op_key, bf16_args)
                 y_t = y[0] if isinstance(y, tuple) else y
                 if isinstance(y_t, torch.Tensor):
                     self.clean_input_store.capture(f"{op_key}.__out__", (y_t,))

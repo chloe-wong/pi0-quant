@@ -11,7 +11,7 @@ For each intercepted vector op, calls are stored consecutively:
   call{N}_input_0          bf16 raw bits — first arg (tensor)
   call{N}_input_1          bf16 raw bits — second arg (tensor or scalar as bf16)
   ...
-  call{N}_reference_output bf16 raw bits — passthrough (aten op) output
+  call{N}_reference_output bf16 raw bits — PyTorch/reference aten op output
   call{N}_fm_output        bf16 raw bits — VPU functional model output
   call{N}_rmse             float32 scalar — RMSE(reference_output, fm_output)
 
@@ -73,7 +73,7 @@ class VectorIOStore:
         op_name   : qualified aten op name e.g. "aten::add", "aten::native_layer_norm"
         layer_tag : transformer layer label e.g. "language.7", "vision", "unattributed"
         inputs    : all positional args (tensors and scalars)
-        ref_output: passthrough (aten) output tensor
+        ref_output: PyTorch/reference aten output tensor
         fm_output : VPU functional model output tensor
         rmse      : RMSE(ref_output, fm_output) — stored as float32 scalar
         """

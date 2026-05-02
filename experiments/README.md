@@ -236,7 +236,7 @@ uv run decode_mxu_npz.py path/to/layer.npz --summary --call 1
 
 ### Two-pass flow
 
-**Pass 1 — Reference (unpatched):** the model runs as-is. If a VPU functional model is active, clean vector-op arguments are captured so Pass 2 can replay each op with the same pristine inputs (isolating per-op error from accumulated upstream error). `nn.Linear` / conv2d / attention outputs are also captured for cumulative RMSE.
+**Pass 1 — Reference (unpatched):** if a VPU functional model is active, each intercepted vector op is run on BF16-quantized arguments, and those BF16 arguments and PyTorch output are captured. Pass 2 replays each op with the same BF16-quantized inputs, isolating per-op error from accumulated upstream error. `nn.Linear` / conv2d / attention outputs are also captured for cumulative RMSE.
 
 **Pass 2 — Patched:** each target vector op is intercepted by `VectorQuantMode.__torch_dispatch__`. When `--vec-functional-model vector` is set, ops are routed through `VectorRTLFunctions` and RMSE is measured against the Pass 1 reference output. Without a functional model the context manager is a no-op and RMSE is all zeros. `nn.Linear` layers are patched as BF16 passthrough (zero matmul error) so that vec-op RMSE is not masked by accumulated matmul error.
 
