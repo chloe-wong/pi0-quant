@@ -243,6 +243,7 @@ class VectorQuantMode(TorchDispatchMode):
         io_store: Optional[VectorIOStore] = None,
         capture_mode: bool = False,
         clean_input_store=None,
+        substitute_clean_inputs: bool = True,
     ) -> None:
         super().__init__()
         self.tracker          = tracker
@@ -257,6 +258,7 @@ class VectorQuantMode(TorchDispatchMode):
         self.io_store         = io_store
         self.capture_mode     = capture_mode
         self.clean_input_store = clean_input_store
+        self.substitute_clean_inputs = substitute_clean_inputs
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -308,7 +310,12 @@ class VectorQuantMode(TorchDispatchMode):
         # ── Functional model path ────────────────────────────────────────────
         if self.functional_model is not None:
             vrf = self.functional_model
-            clean_args = self.clean_input_store.get(op_key) if self.clean_input_store is not None else None
+            # When substitute_clean_inputs is False, FM sees real upstream args
+            # (noise propagates) but the store is still consulted for the
+            # comparison reference further down.
+            clean_args = (self.clean_input_store.get(op_key)
+                          if (self.substitute_clean_inputs and self.clean_input_store is not None)
+                          else None)
             effective_args = clean_args if clean_args is not None else args
 
             _in_quant_guard.active = True
@@ -447,6 +454,7 @@ def patch_vector_ops(
     io_store: Optional[VectorIOStore] = None,
     capture_mode: bool = False,
     clean_input_store=None,
+    substitute_clean_inputs: bool = True,
 ) -> tuple[list, VectorQuantMode, dict]:
     """
     Register layer-tag hooks for attribution and return a
@@ -504,6 +512,7 @@ def patch_vector_ops(
         io_store=io_store,
         capture_mode=capture_mode,
         clean_input_store=clean_input_store,
+        substitute_clean_inputs=substitute_clean_inputs,
     )
 
     fm_label = (
