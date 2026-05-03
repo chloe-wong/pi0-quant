@@ -50,7 +50,10 @@ import torch
 
 def _to_bf16_numpy(t: torch.Tensor) -> np.ndarray:
     """Store bf16 tensor as int16 raw bits (numpy lacks native bf16).
-    Assumes input is already bfloat16. Reload with: torch.from_numpy(arr).view(torch.bfloat16)"""
+    Casts to bfloat16 first if needed (e.g. float32 state_proj).
+    Reload with: torch.from_numpy(arr).view(torch.bfloat16)"""
+    if t.dtype != torch.bfloat16:
+        t = t.to(torch.bfloat16)
     return t.detach().view(torch.int16).cpu().numpy()
 
 

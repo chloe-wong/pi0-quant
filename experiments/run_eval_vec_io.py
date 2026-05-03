@@ -457,7 +457,8 @@ def run(
     }
     ref_hooks = ref_store.register_hooks(model, layer_names)
 
-    # Capture clean vector-op args during the reference pass for error-free RMSE replay.
+    # Capture BF16 vector-op args/output during the reference pass so
+    # PyTorch reference and VPU FM compare on the same input values.
     clean_input_store = ReferenceStore() if vec_fm is not None else None
     if clean_input_store is not None:
         cap_handles, cap_ctx, _ = patch_vector_ops(
