@@ -443,7 +443,6 @@ def run(
     propagate_noise: bool = False,
     out_dir: Optional[Path] = None,
     functional_model_name: Optional[str] = None,
-    capture_vec_ref: bool = False,
 ) -> tuple[StatsTracker, StatsTracker]:
     """Patch model, run observations, unpatch. Returns (mx_tracker, vec_tracker)."""
     mx_tracker  = StatsTracker()
@@ -467,15 +466,9 @@ def run(
     ref_hooks = ref_store.register_hooks(model, layer_names)
 
     # Capture clean vector-op args during the reference pass for error-free RMSE replay.
-    # Default: created when there's an FM. propagate_noise alone disables it (no per-op
-    # measurement, full propagation). capture_vec_ref re-enables it AS A REFERENCE STORE
-    # only — Pass 2 leaves substitute_clean_inputs=False so noise still propagates while
-    # per-op vec RMSE is recorded against the captured BF16 references.
-    clean_input_store = (
-        ReferenceStore()
-        if vec_fm is not None and (not propagate_noise or capture_vec_ref)
-        else None
-    )
+    # When propagate_noise is set, skip Pass 1 entirely so FM outputs propagate forward
+    # in Pass 2 as inputs to subsequent ops, letting quantization noise accumulate end-to-end.
+    clean_input_store = ReferenceStore() if (vec_fm is not None and not propagate_noise) else None
     if clean_input_store is not None:
         cap_handles, cap_ctx, _ = patch_vector_ops(
             model,
@@ -586,7 +579,6 @@ def run(
         estimated_total=_estimated_total,
         io_store=vector_io_store,
         clean_input_store=clean_input_store,
-        substitute_clean_inputs=not propagate_noise,
     )
 
     n_obs = len(observations)
@@ -698,12 +690,6 @@ def main() -> None:
                              "use this for measuring noise at the final layer. "
                              "Default off: two-pass clean-input mode measures each layer in isolation. "
                              "Incompatible with --save-tensors.")
-    parser.add_argument("--capture-vec-ref", action="store_true",
-                        help="Only meaningful with --propagate-noise. Run Pass 1 in capture mode "
-                             "to populate a clean-reference store, but do NOT substitute clean "
-                             "inputs into Pass 2 — noise still propagates. Restores per-op vec "
-                             "RMSE recording so summary.csv has populated vec rows alongside the "
-                             "actions_<i>.npy. Adds ~Pass-1 overhead and clean-store memory.")
     parser.add_argument("--trace", action="store_true",
                         help="Print one line per op as it fires with shape and RMSE.")
 
@@ -714,9 +700,6 @@ def main() -> None:
     if args.propagate_noise and args.save_tensors:
         parser.error("--propagate-noise is incompatible with --save-tensors "
                      "(per-op reference outputs are not meaningful when noise propagates)")
-    if args.capture_vec_ref and not args.propagate_noise:
-        parser.error("--capture-vec-ref only makes sense with --propagate-noise "
-                     "(without it, clean-input mode already records per-op vec RMSE)")
 
     op_scopes: set[OpScope] = set()
     for s in args.ops.split(","):
@@ -792,7 +775,6 @@ def main() -> None:
         propagate_noise=args.propagate_noise,
         out_dir=out_dir,
         functional_model_name=args.functional_model,
-        capture_vec_ref=args.capture_vec_ref,
     )
     elapsed_s = time.monotonic() - t0
     config_record["elapsed_seconds"] = round(elapsed_s, 2)
