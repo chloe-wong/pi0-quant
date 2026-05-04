@@ -51,6 +51,14 @@ from .functional_models import (
     list_functional_models,
 )
 from .stats_tracker import StatsTracker, Component, StatsReport
+from .action_metrics import (
+    ActionMetrics,
+    ActionThresholds,
+    CheckResult,
+    compute_action_metrics,
+    BaselineVariance,
+    compute_baseline_variance_from_actions,
+)
 from .eval_harness  import (
     QuantConfig,
     EvalResult,
@@ -59,6 +67,7 @@ from .eval_harness  import (
     default_sweep_configs,
     results_to_dataframe,
     save_results,
+    compute_baseline_variance,
 )
 
 __all__ = [
@@ -105,6 +114,13 @@ __all__ = [
     "StatsTracker",
     "Component",
     "StatsReport",
+    # Action metrics
+    "ActionMetrics",
+    "ActionThresholds",
+    "CheckResult",
+    "compute_action_metrics",
+    "BaselineVariance",
+    "compute_baseline_variance_from_actions",
     # Evaluation
     "QuantConfig",
     "EvalResult",
@@ -113,4 +129,5 @@ __all__ = [
     "default_sweep_configs",
     "results_to_dataframe",
     "save_results",
+    "compute_baseline_variance",
 ]

@@ -39,9 +39,7 @@ the episode.
 
 from __future__ import annotations
 
-import copy
 import time
-import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -51,6 +49,10 @@ import torch.nn as nn
 from .quant_types import QuantFormat
 from .model_patcher import patch_model, unpatch_model, count_layers
 from .stats_tracker import StatsTracker, StatsReport, Component
+from .action_metrics import (
+    ActionMetrics, ActionThresholds, CheckResult, compute_action_metrics,
+    BaselineVariance, compute_baseline_variance_from_actions,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -87,13 +89,21 @@ class EvalResult:
     # Action-level RMSE across all evaluated observations
     action_rmse: float
     action_rmse_per_component: Dict[str, float]  # keyed by component name
+    # Rich action-level metrics (per-step, per-dim, percentiles, pass/fail)
+    action_metrics: Optional[ActionMetrics]
     # Per-layer and per-component stats from the StatsTracker
     stats_report: StatsReport
     # Timing
     n_observations: int
     inference_time_s: float
 
-    def print_summary(self) -> None:
+    def check(self, thresholds: ActionThresholds) -> CheckResult:
+        """Check action metrics against acceptance thresholds."""
+        if self.action_metrics is None:
+            return CheckResult(passed=True, failures=["no action_metrics computed"])
+        return self.action_metrics.check(thresholds)
+
+    def print_summary(self, show_action_metrics: bool = True) -> None:
         print(f"\n{'='*60}")
         print(f"Config: {self.config.label}")
         print(f"  Observations: {self.n_observations}")
@@ -104,9 +114,11 @@ class EvalResult:
             print(f"    {comp:16s}: {rmse:.6e}")
         print()
         self.stats_report.print(show_layers=False)
+        if show_action_metrics and self.action_metrics is not None:
+            self.action_metrics.print_report()
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "config":           self.config.label,
             "mx_input_fmt":     self.config.mx_input_fmt.value,
             "mx_output_fmt":    self.config.mx_output_fmt.value,
@@ -117,6 +129,9 @@ class EvalResult:
             "layers":           self.stats_report.layer_rows,
             "components":       self.stats_report.component_rows,
         }
+        if self.action_metrics is not None:
+            d["action_metrics"] = self.action_metrics.to_dict()
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +207,9 @@ def run_quantization_eval(
             print(f"  {i+1}/{len(observations)}")
     elapsed = time.perf_counter() - t0
 
-    # --- Step 4: compute action RMSE ----------------------------------------
-    action_rmse = _compute_action_rmse(reference_actions, quant_actions)
+    # --- Step 4: compute action metrics --------------------------------------
+    action_metrics = compute_action_metrics(reference_actions, quant_actions)
+    action_rmse = action_metrics.overall_rmse
 
     # Action RMSE split by which component contributes most is complex to
     # compute directly (would need feature attribution).  Instead, we report
@@ -212,6 +228,7 @@ def run_quantization_eval(
         config=config,
         action_rmse=action_rmse,
         action_rmse_per_component=action_rmse_per_component,
+        action_metrics=action_metrics,
         stats_report=tracker.summary(),
         n_observations=len(observations),
         inference_time_s=elapsed,
@@ -341,6 +358,51 @@ def results_to_dataframe(results: List[EvalResult]):
     return pd.DataFrame(rows)
 
 
+def compute_baseline_variance(
+    model: nn.Module,
+    observations: List[Any],
+    infer_fn: Callable[[nn.Module, Any], torch.Tensor],
+    n_seeds: int = 10,
+    base_seed: int = 0,
+    verbose: bool = True,
+) -> BaselineVariance:
+    """
+    Measure the FP32 model's intrinsic action variance across diffusion seeds.
+
+    Runs each observation n_seeds times with different torch.manual_seed()
+    values and measures the spread.  The resulting BaselineVariance can
+    generate ActionThresholds via .to_thresholds(k) — quantization error
+    below k * baseline_std is lost in the model's own noise.
+
+    Args:
+        model:        Unpatched FP32 model.
+        observations: List of observations to evaluate on.
+        infer_fn:     Callable (model, observation) → actions tensor.
+        n_seeds:      Number of different seeds per observation (default 10).
+        base_seed:    Starting seed value (seeds will be base_seed .. base_seed + n_seeds - 1).
+        verbose:      Print progress.
+
+    Returns:
+        BaselineVariance with per-step, per-dim, and percentile breakdowns.
+    """
+    if verbose:
+        print(f"[baseline] Measuring FP32 variance: {len(observations)} obs x {n_seeds} seeds...")
+
+    actions_per_obs: List[List[torch.Tensor]] = []
+    for i, obs in enumerate(observations):
+        seed_actions = []
+        for s in range(n_seeds):
+            torch.manual_seed(base_seed + s)
+            with torch.no_grad():
+                acts = infer_fn(model, obs)
+            seed_actions.append(acts.detach().cpu())
+        actions_per_obs.append(seed_actions)
+        if verbose and (i + 1) % max(1, len(observations) // 5) == 0:
+            print(f"  {i+1}/{len(observations)} observations done")
+
+    return compute_baseline_variance_from_actions(actions_per_obs)
+
+
 def save_results(results: List[EvalResult], path: str) -> None:
     """Save a list of EvalResult to a JSON file."""
     import json
@@ -368,25 +430,3 @@ def _collect_actions(
     return actions
 
 
-def _compute_action_rmse(
-    reference: List[torch.Tensor],
-    quantized: List[torch.Tensor],
-) -> float:
-    """
-    Compute overall RMSE between reference and quantized action predictions.
-
-    Each element in the lists is an action tensor of shape [..., action_horizon, action_dim]
-    or any shape — we just flatten and compare.
-    """
-    total_se = 0.0
-    total_n  = 0
-    for ref, quant in zip(reference, quantized):
-        ref_f   = ref.float().cpu()
-        quant_f = quant.float().cpu()
-        diff    = ref_f - quant_f
-        total_se += diff.pow(2).sum().item()
-        total_n  += diff.numel()
-
-    if total_n == 0:
-        return float("nan")
-    return math.sqrt(total_se / total_n)
