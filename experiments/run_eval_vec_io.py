@@ -72,6 +72,7 @@ from pi0_inout import (
     patch_attn_siglip_eager, unpatch_attn_siglip_eager,
     patch_vector_ops, unpatch_vector_ops,
     VectorIOStore,
+    get_functional_model_factory, list_functional_models,
 )
 from pi0_inout.model_patcher import OpScope, ALL_SCOPES, patch_conv2d, unpatch_conv2d
 from pi0_inout.reference_store import ReferenceStore
@@ -439,6 +440,9 @@ def run(
     t0: float,
     trace: bool = False,
     vector_io_store: Optional[VectorIOStore] = None,
+    propagate_noise: bool = False,
+    out_dir: Optional[Path] = None,
+    functional_model_name: Optional[str] = None,
 ) -> tuple[StatsTracker, StatsTracker]:
     """Patch model, run observations, unpatch. Returns (mx_tracker, vec_tracker)."""
     mx_tracker  = StatsTracker()
@@ -449,6 +453,10 @@ def run(
         from funct_models_vector.vector_rtl_forward import VectorRTLFunctions
         vec_fm = VectorRTLFunctions(num_lanes=16)
 
+    fm_factory = None
+    if functional_model_name is not None:
+        fm_factory = get_functional_model_factory(functional_model_name)
+
     # ── Capture reference layer outputs for cumulative RMSE ──────────────────
     ref_store = ReferenceStore()
     layer_names = {
@@ -458,7 +466,9 @@ def run(
     ref_hooks = ref_store.register_hooks(model, layer_names)
 
     # Capture clean vector-op args during the reference pass for error-free RMSE replay.
-    clean_input_store = ReferenceStore() if vec_fm is not None else None
+    # When propagate_noise is set, skip Pass 1 entirely so FM outputs propagate forward
+    # in Pass 2 as inputs to subsequent ops, letting quantization noise accumulate end-to-end.
+    clean_input_store = ReferenceStore() if (vec_fm is not None and not propagate_noise) else None
     if clean_input_store is not None:
         cap_handles, cap_ctx, _ = patch_vector_ops(
             model,
@@ -506,14 +516,14 @@ def run(
 
     print(f"[reference_store] Captured {len(ref_store)} reference layer outputs.")
 
-    # ── Patch model (linear/conv2d/attention with BF16 passthrough) ───────────
+    # ── Patch model (linear/conv2d/attention; FM applies if --functional-model is set) ──
     patch_model(
         model,
         mx_input_fmt=QuantFormat.BFLOAT16,
         mx_output_fmt=QuantFormat.BFLOAT16,
         tracker=mx_tracker,
         active_groups=active_groups,
-        functional_model_factory=None,
+        functional_model_factory=fm_factory,
         op_scopes=op_scopes,
         reference_store=ref_store,
         trace=trace,
@@ -532,7 +542,7 @@ def run(
             mx_output_fmt=QuantFormat.BFLOAT16,
             tracker=mx_tracker,
             active_groups=active_groups,
-            functional_model_factory=None,
+            functional_model_factory=fm_factory,
             reference_store=ref_store,
         )
     if OpScope.ATTENTION in op_scopes:
@@ -540,21 +550,21 @@ def run(
             model,
             active_groups=active_groups,
             tracker=mx_tracker,
-            functional_model_factory=None,
+            functional_model_factory=fm_factory,
             reference_store=ref_store,
         )
         patch_attn_eager(
             model,
             active_groups=active_groups,
             tracker=mx_tracker,
-            functional_model_factory=None,
+            functional_model_factory=fm_factory,
             reference_store=ref_store,
         )
         patch_attn_siglip_eager(
             model,
             active_groups=active_groups,
             tracker=mx_tracker,
-            functional_model_factory=None,
+            functional_model_factory=fm_factory,
             reference_store=ref_store,
         )
     else:
@@ -582,7 +592,10 @@ def run(
             obs_t0 = time.monotonic()
             torch.manual_seed(i)
             ref_store.reset_counters()
-            model.sample_actions(str(device), obs, num_steps=num_steps)
+            actions = model.sample_actions(str(device), obs, num_steps=num_steps)
+            if out_dir is not None:
+                np.save(str(out_dir / f"actions_{i:04d}.npy"),
+                        actions.detach().float().cpu().numpy())
             obs_elapsed = time.monotonic() - obs_t0
             print(f"[obs {i + 1}/{n_obs}] done in {obs_elapsed:.1f}s", flush=True)
             _print_intermediate(
@@ -644,6 +657,12 @@ def main() -> None:
                         help="Route all vector ops through VectorRTLFunctions. "
                              "Required when --save-tensors is set.")
 
+    # Matrix path
+    parser.add_argument("--functional-model", metavar="NAME",
+                        default=None,
+                        help=f"Hardware-accurate model for matmuls (linear/conv2d/attention). "
+                             f"Available: {list_functional_models()}. Default: BF16 passthrough.")
+
     # Op scope selection
     all_scope_names = [s.value for s in ALL_SCOPES]
     parser.add_argument("--ops", metavar="OP1,OP2,...",
@@ -664,6 +683,13 @@ def main() -> None:
                         help="Save per-op vector I/O tensors to "
                              "<results-dir>/<label>/vec_tensors/ (one .npz per (layer, op)). "
                              "Requires --vec-functional-model.")
+    parser.add_argument("--propagate-noise", action="store_true",
+                        help="Propagate FM outputs forward as inputs to subsequent ops, so "
+                             "quantization noise accumulates end-to-end. The final action chunk "
+                             "(with cumulative noise) is captured per obs to actions_<i>.npy — "
+                             "use this for measuring noise at the final layer. "
+                             "Default off: two-pass clean-input mode measures each layer in isolation. "
+                             "Incompatible with --save-tensors.")
     parser.add_argument("--trace", action="store_true",
                         help="Print one line per op as it fires with shape and RMSE.")
 
@@ -671,6 +697,9 @@ def main() -> None:
 
     if args.save_tensors and args.vec_functional_model is None:
         parser.error("--save-tensors requires --vec-functional-model (no FM means no fm_output to store)")
+    if args.propagate_noise and args.save_tensors:
+        parser.error("--propagate-noise is incompatible with --save-tensors "
+                     "(per-op reference outputs are not meaningful when noise propagates)")
 
     op_scopes: set[OpScope] = set()
     for s in args.ops.split(","):
@@ -743,6 +772,9 @@ def main() -> None:
         t0=t0,
         trace=args.trace,
         vector_io_store=vector_io_store,
+        propagate_noise=args.propagate_noise,
+        out_dir=out_dir,
+        functional_model_name=args.functional_model,
     )
     elapsed_s = time.monotonic() - t0
     config_record["elapsed_seconds"] = round(elapsed_s, 2)
